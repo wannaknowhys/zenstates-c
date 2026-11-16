@@ -66,6 +66,10 @@ static HWND g_chkAuto;
 static char g_exeDir[MAX_PATH];
 static char g_iniPath[MAX_PATH];
 static int  g_iniFound = 0;
+/* Power keys are optional in 0.2.0: whether they were present when loaded,
+ * and the values shown then (a Save must not re-add keys the user never set). */
+static int  g_pptPresent, g_tdcPresent, g_edcPresent;
+static int  g_pptLoaded, g_tdcLoaded, g_edcLoaded;
 
 static void set_font(HWND h) { if (g_font) SendMessage(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
 
@@ -114,29 +118,43 @@ static int get_num(HWND ed)
     return ok ? (int)v : 0;
 }
 
+/* Join dir + "\\" + name into out (size out_size). Returns 1 on success,
+ * 0 if it would not fit (callers fall back to the bare name). This avoids
+ * snprintf("%s\\%s") into a MAX_PATH buffer, which newer gcc flags with
+ * -Wformat-truncation because the directory part can be up to MAX_PATH. */
+static int path_join(char *out, size_t out_size, const char *dir, const char *name)
+{
+    size_t dl = strlen(dir), nl = strlen(name);
+    if (dl + 1 + nl + 1 > out_size) return 0;
+    memcpy(out, dir, dl);
+    out[dl] = '\\';
+    memcpy(out + dl + 1, name, nl + 1);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* INI                                                                 */
 /* ------------------------------------------------------------------ */
 
 static void resolve_ini(void)
 {
-    char cand[MAX_PATH];
-    snprintf(cand, sizeof(cand), "%s\\zenstates-c.ini", g_exeDir);
-    if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+    char cand[MAX_PATH], cand2[MAX_PATH];
+    if (path_join(cand, sizeof(cand), g_exeDir, "zenstates-c.ini") &&
+        GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
         strcpy(g_iniPath, cand);
         g_iniFound = 1;
         return;
     }
-    if (GetEnvironmentVariableA("ProgramData", cand, sizeof(cand)) > 0) {
-        char cand2[MAX_PATH];
-        snprintf(cand2, sizeof(cand2), "%s\\ZenStates-C\\zenstates-c.ini", cand);
-        if (GetFileAttributesA(cand2) != INVALID_FILE_ATTRIBUTES) {
-            strcpy(g_iniPath, cand2);
-            g_iniFound = 1;
-            return;
-        }
+    if (GetEnvironmentVariableA("ProgramData", cand, sizeof(cand)) > 0 &&
+        path_join(cand2, sizeof(cand2), cand, "ZenStates-C") &&
+        path_join(cand, sizeof(cand), cand2, "zenstates-c.ini") &&
+        GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+        strcpy(g_iniPath, cand);
+        g_iniFound = 1;
+        return;
     }
-    snprintf(g_iniPath, sizeof(g_iniPath), "%s\\zenstates-c.ini", g_exeDir);
+    if (!path_join(g_iniPath, sizeof(g_iniPath), g_exeDir, "zenstates-c.ini"))
+        strcpy(g_iniPath, "zenstates-c.ini");
     g_iniFound = 0;
 }
 
@@ -144,9 +162,18 @@ static void load_ini_to_controls(void)
 {
     set_num(g_edSingle, GetPrivateProfileIntA("Boost", "SingleCoreMaxMHz", 4000, g_iniPath));
     set_num(g_edAll,    GetPrivateProfileIntA("Boost", "AllCoreMaxMHz",    3900, g_iniPath));
-    set_num(g_edPpt,    GetPrivateProfileIntA("Power", "PPT_W",            88,   g_iniPath));
-    set_num(g_edTdc,    GetPrivateProfileIntA("Power", "TDC_A",            60,   g_iniPath));
-    set_num(g_edEdc,    GetPrivateProfileIntA("Power", "EDC_A",            90,   g_iniPath));
+    {
+        char s[32];
+        g_pptPresent = GetPrivateProfileStringA("Power", "PPT_W", "", s, sizeof(s), g_iniPath) > 0 && s[0];
+        g_tdcPresent = GetPrivateProfileStringA("Power", "TDC_A", "", s, sizeof(s), g_iniPath) > 0 && s[0];
+        g_edcPresent = GetPrivateProfileStringA("Power", "EDC_A", "", s, sizeof(s), g_iniPath) > 0 && s[0];
+    }
+    g_pptLoaded = GetPrivateProfileIntA("Power", "PPT_W", 88, g_iniPath);
+    g_tdcLoaded = GetPrivateProfileIntA("Power", "TDC_A", 60, g_iniPath);
+    g_edcLoaded = GetPrivateProfileIntA("Power", "EDC_A", 90, g_iniPath);
+    set_num(g_edPpt, g_pptLoaded);
+    set_num(g_edTdc, g_tdcLoaded);
+    set_num(g_edEdc, g_edcLoaded);
     CheckDlgButton(g_pages[2], ID_CHK_AUTO,
                    GetPrivateProfileIntA("Startup", "AutoApply", 1, g_iniPath) ? BST_CHECKED : BST_UNCHECKED);
     {
@@ -165,12 +192,21 @@ static int save_ini_from_controls(void)
     WritePrivateProfileStringA("Boost", "SingleCoreMaxMHz", b, g_iniPath);
     snprintf(b, sizeof(b), "%d", get_num(g_edAll));
     WritePrivateProfileStringA("Boost", "AllCoreMaxMHz", b, g_iniPath);
-    snprintf(b, sizeof(b), "%d", get_num(g_edPpt));
-    WritePrivateProfileStringA("Power", "PPT_W", b, g_iniPath);
-    snprintf(b, sizeof(b), "%d", get_num(g_edTdc));
-    WritePrivateProfileStringA("Power", "TDC_A", b, g_iniPath);
-    snprintf(b, sizeof(b), "%d", get_num(g_edEdc));
-    WritePrivateProfileStringA("Power", "EDC_A", b, g_iniPath);
+    /* Power keys are optional in 0.2.0: write one only if it was present
+     * when loaded, or the user changed the shown value. Otherwise a GUI
+     * Save would silently re-enable power limiting with the shown defaults. */
+    if (g_pptPresent || get_num(g_edPpt) != g_pptLoaded) {
+        snprintf(b, sizeof(b), "%d", get_num(g_edPpt));
+        WritePrivateProfileStringA("Power", "PPT_W", b, g_iniPath);
+    }
+    if (g_tdcPresent || get_num(g_edTdc) != g_tdcLoaded) {
+        snprintf(b, sizeof(b), "%d", get_num(g_edTdc));
+        WritePrivateProfileStringA("Power", "TDC_A", b, g_iniPath);
+    }
+    if (g_edcPresent || get_num(g_edEdc) != g_edcLoaded) {
+        snprintf(b, sizeof(b), "%d", get_num(g_edEdc));
+        WritePrivateProfileStringA("Power", "EDC_A", b, g_iniPath);
+    }
     WritePrivateProfileStringA("Startup", "AutoApply",
         IsDlgButtonChecked(g_pages[2], ID_CHK_AUTO) == BST_CHECKED ? "1" : "0",
         g_iniPath);
@@ -209,7 +245,7 @@ static int run_elevated(const char *exe, const char *params, DWORD *exit_code)
             MessageBoxA(NULL, "UAC prompt was cancelled.", "ZenStates-C GUI", MB_ICONWARNING | MB_OK);
         else {
             char b[256];
-            snprintf(b, sizeof(b), "Failed to start %s (error %lu).", exe, (unsigned long)e);
+            snprintf(b, sizeof(b), "Failed to start %.200s (error %lu).", exe, (unsigned long)e);
             MessageBoxA(NULL, b, "ZenStates-C GUI", MB_ICONERROR | MB_OK);
         }
         return 0;
@@ -241,20 +277,21 @@ static LRESULT CALLBACK PageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             make_label(hwnd, 12, 12, 400, "Boost caps -- these are upper limits, NOT a fixed frequency.");
             make_label(hwnd, 12, 32, 400, "Below the cap, Boost still scales and idle still downclocks.");
             make_label(hwnd, 12, 66, 150, "Single-core boost cap (MHz):");
-            g_edSingle = make_number(hwnd, ID_ED_SINGLE, ID_UP_SINGLE, 180, 62, 3600, 4200, 4000);
+            g_edSingle = make_number(hwnd, ID_ED_SINGLE, ID_UP_SINGLE, 180, 62, 3000, 6000, 4000);
             make_label(hwnd, 12, 100, 150, "All-core boost cap (MHz):");
-            g_edAll = make_number(hwnd, ID_ED_ALL, ID_UP_ALL, 180, 96, 3600, 4200, 3900);
-            make_label(hwnd, 12, 140, 400, "Stock max is 4200 MHz. 4000 / 3900 lowers the peak VID");
-            make_label(hwnd, 12, 158, 400, "from ~1.45 V towards ~1.35 V. See README.md.");
+            g_edAll = make_number(hwnd, ID_ED_ALL, ID_UP_ALL, 180, 96, 3000, 6000, 3900);
+            make_label(hwnd, 12, 140, 400, "Stock max is read from the CPU when applied (0x6E);");
+            make_label(hwnd, 12, 158, 400, "values above it are clamped. See README.md.");
         } else if (page == 1) {
-            make_label(hwnd, 12, 12, 400, "Power limits -- stock values for Ryzen 5 3600 (PBO off).");
+            make_label(hwnd, 12, 12, 400, "Power limits -- optional. Unset keys are left as the BIOS set them.");
             make_label(hwnd, 12, 66, 150, "PPT (W):");
-            g_edPpt = make_number(hwnd, ID_ED_PPT, ID_UP_PPT, 180, 62, 45, 142, 88);
+            g_edPpt = make_number(hwnd, ID_ED_PPT, ID_UP_PPT, 180, 62, 45, 300, 88);
             make_label(hwnd, 12, 100, 150, "TDC (A):");
-            g_edTdc = make_number(hwnd, ID_ED_TDC, ID_UP_TDC, 180, 96, 30, 95, 60);
+            g_edTdc = make_number(hwnd, ID_ED_TDC, ID_UP_TDC, 180, 96, 30, 200, 60);
             make_label(hwnd, 12, 134, 150, "EDC (A):");
-            g_edEdc = make_number(hwnd, ID_ED_EDC, ID_UP_EDC, 180, 130, 45, 140, 90);
-            make_label(hwnd, 12, 172, 400, "Out-of-range values are clamped by zenstates-c.exe, not rejected.");
+            g_edEdc = make_number(hwnd, ID_ED_EDC, ID_UP_EDC, 180, 130, 45, 300, 90);
+            make_label(hwnd, 12, 172, 400, "Shown values are Ryzen 5 3600 stock (88 / 60 / 90). Set them to");
+            make_label(hwnd, 12, 190, 400, "your own CPU's stock values, or leave this page alone.");
         } else {
             HWND chk = CreateWindowExA(0, "BUTTON", "Apply at boot (install scheduled task)",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
@@ -328,7 +365,8 @@ static void do_apply_now(HWND hwnd)
     char exe[MAX_PATH], msg[512];
     DWORD code = 0;
     if (!save_ini_from_controls()) return;
-    snprintf(exe, sizeof(exe), "%s\\zenstates-c.exe", g_exeDir);
+    if (!path_join(exe, sizeof(exe), g_exeDir, "zenstates-c.exe"))
+        strcpy(exe, "zenstates-c.exe");
     if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) {
         MessageBoxA(hwnd, "zenstates-c.exe was not found next to this GUI.",
                     "ZenStates-C GUI", MB_ICONERROR | MB_OK);
@@ -351,7 +389,8 @@ static void do_autostart(HWND hwnd, int install)
 {
     char exe[MAX_PATH], params[1024];
     DWORD code = 0;
-    snprintf(exe, sizeof(exe), "%s\\zenstates-c.exe", g_exeDir);
+    if (!path_join(exe, sizeof(exe), g_exeDir, "zenstates-c.exe"))
+        strcpy(exe, "zenstates-c.exe");
     if (install) {
         /* ONSTART as SYSTEM, highest privileges, 30 s delay so the
          * PawnIO driver is up. /F overwrites an existing task. */
@@ -505,7 +544,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
 
-    hwnd = CreateWindowExA(0, "ZenStatesC_GUI", "ZenStates-C -- Boost cap settings (Ryzen 5 3600)",
+    hwnd = CreateWindowExA(0, "ZenStatesC_GUI", "ZenStates-C -- Boost cap settings",
                            WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
                            CW_USEDEFAULT, CW_USEDEFAULT, 470, 370,
                            NULL, NULL, hInstance, NULL);

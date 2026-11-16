@@ -1,16 +1,31 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * zenstates-vf.c -- empirical V/F sweep for Ryzen 5 3600 (Matisse, Zen 2).
+ * zenstates-vf.c -- empirical V/F sweep for Ryzen desktop CPUs (Zen 2 / Zen 3), 0.2.0.
  *
  * What it measures (and what it does NOT):
  *   There is NO SMU command that dumps the fused V/F table: ZenStates-Core
  *   has no such command, and TransferTableToDram (RSMU 0x05) exports the
  *   PowerTable telemetry (live frequency / voltage / power), not a curve.
- *   The 3600's V/F curve lives inside SMU firmware as fused FIT data.
+ *   The V/F curve lives inside SMU firmware as fused FIT data.
  *   So this tool measures the curve instead of reading it: for each target
- *   frequency it caps Boost to that frequency (the same 0x29/0x2B messages
+ *   frequency it caps Boost to that frequency (the same cap messages
  *   zenstates-c.c uses), pins a scalar spin-load to one core so that core
  *   actually boosts to the cap, and reads the VID that SMU requests at that
  *   point. One CSV row per sample; the median per target is the V/F point.
+ *
+ * Scope: Matisse / Castle Peak and Vermeer / Chagall / Milan only -- the
+ *   sweep needs BOTH the single-core and the all-core cap, and Zen 4 has
+ *   no single-core cap command in the sourced table, so Zen 4 is refused
+ *   (the all-core cap alone cannot constrain a single-core load). Zen 1 /
+ *   Zen+ / Rome / APUs / Zen 5 have no cap command at all and are refused
+ *   too. See zenstates-c.c for the family table and sources.
+ *
+ * Fmax (no hardcoded 4200 any more): at startup the tool reads 0x6E
+ *   GetBoostLimitFrequency -- the same call upstream's Cpu.GetFMax() uses.
+ *   That value is the sweep's start (unless the INI sets StartMHz) and the
+ *   restore value at the end. The sweep is therefore non-destructive: if a
+ *   cap was already installed (e.g. by zenstates-c's autostart), the sweep
+ *   restores exactly that cap at the end. If the read fails or returns an
+ *   implausible value the tool aborts before sending any cap.
  *
  * Read path (all from ZenStates-Core source, same as the main program):
  *   MSR 0xC0010293 HW_PSTATE_STATUS, read on the measured core via PawnIO
@@ -25,16 +40,14 @@
  *   the same core clock / VID. The load is a plain scalar integer loop
  *   (no AVX): the curve measured is the scalar-boost curve.
  *
- * What it writes: ONLY the two Boost-limit SMU commands (0x29/0x2B) and,
- *   at the end, a restore of both caps to 4200 MHz (stock Fmax = uncapped
- *   for a 3600). It never writes an MSR, never sets a fixed frequency,
+ * What it writes: ONLY the two Boost-limit SMU commands (per the family
+ *   table in zenstates-c.c) and, at the end, a restore of both caps to the
+ *   value 0x6E reported before the sweep (the pre-sweep limit, not a
+ *   constant). It never writes an MSR, never sets a fixed frequency,
  *   never sets a fixed voltage or VID. A reboot also restores stock.
- *   WARNING: if zenstates-c's autostart cap (4000/3900) is already
- *   installed, this sweep's final restore to 4200 will undo it -- re-run
- *   zenstates-c.exe afterwards to re-apply the cap.
  *
  * Plumbing (PawnIO device, module loading, SMU send, MSR read, HWCR fix,
- * PCI lock, admin + Matisse checks) is copied from zenstates-c.c in this
+ * PCI lock, admin + CPU checks) is copied from zenstates-c.c in this
  * same repo, which documents the evidence chain in SLOW_MODE.md.
  *
  * Config: zenstates-vf.ini next to the exe (see zenstates-vf.ini).
@@ -59,7 +72,8 @@
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
 
-#define DEFAULT_START_MHZ   4200
+/* StartMHz 0 (or absent) = start at the Fmax read back from the SMU. */
+#define DEFAULT_START_MHZ   0
 #define DEFAULT_END_MHZ     3600
 #define DEFAULT_STEP_MHZ    100
 #define DEFAULT_SETTLE_MS   1500
@@ -67,9 +81,10 @@
 #define DEFAULT_SAMPLE_INT_MS 200
 #define DEFAULT_LOAD_CORE   0
 
-#define FREQ_MIN 3600
-#define FREQ_MAX 4200
-#define STOCK_FMAX_MHZ 4200
+/* Wide sanity clamps only; the real ceiling is the Fmax read back from
+ * the SMU at startup (see main). */
+#define FREQ_FLOOR 3000
+#define FREQ_CEIL  6000
 
 #define MSR_HW_PSTATE_STATUS 0xC0010293u
 #define MSR_HWCR             0xC0010015u
@@ -117,6 +132,20 @@ static int clamp_int(int v, int lo, int hi, const char *name)
     return v;
 }
 
+/* Join dir + "\\" + name into out (size out_size). Returns 1 on success,
+ * 0 if it would not fit (callers fall back to the bare name). This avoids
+ * snprintf("%s\\%s") into a MAX_PATH buffer, which newer gcc flags with
+ * -Wformat-truncation because the directory part can be up to MAX_PATH. */
+static int path_join(char *out, size_t out_size, const char *dir, const char *name)
+{
+    size_t dl = strlen(dir), nl = strlen(name);
+    if (dl + 1 + nl + 1 > out_size) return 0;
+    memcpy(out, dir, dl);
+    out[dl] = '\\';
+    memcpy(out + dl + 1, name, nl + 1);
+    return 1;
+}
+
 static void get_exe_dir(void)
 {
     char path[MAX_PATH];
@@ -144,10 +173,13 @@ static void load_config(Config *c)
     c->samples   = DEFAULT_SAMPLES;
     c->sample_int_ms = DEFAULT_SAMPLE_INT_MS;
     c->load_core = DEFAULT_LOAD_CORE;
-    snprintf(c->csv_path, sizeof(c->csv_path), "%s\\zenstates-vf.csv", g_exe_dir);
-    snprintf(c->log_path, sizeof(c->log_path), "%s\\zenstates-vf.log", g_exe_dir);
+    if (path_join(c->csv_path, sizeof(c->csv_path), g_exe_dir, "zenstates-vf.csv") == 0)
+        strcpy(c->csv_path, "zenstates-vf.csv");
+    if (path_join(c->log_path, sizeof(c->log_path), g_exe_dir, "zenstates-vf.log") == 0)
+        strcpy(c->log_path, "zenstates-vf.log");
 
-    snprintf(cand, sizeof(cand), "%s\\zenstates-vf.ini", g_exe_dir);
+    if (path_join(cand, sizeof(cand), g_exe_dir, "zenstates-vf.ini") == 0)
+        strcpy(cand, "zenstates-vf.ini");
     if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
         strcpy(c->ini_path, cand);
         c->ini_found = 1;
@@ -177,13 +209,25 @@ static void load_config(Config *c)
         if (GetPrivateProfileStringA("Logging", "LogPath", "", s, sizeof(s), c->ini_path) > 0 && s[0])
             strcpy(c->log_path, s);
     }
-    c->start_mhz = clamp_int(c->start_mhz, FREQ_MIN, FREQ_MAX, "StartMHz");
-    c->end_mhz   = clamp_int(c->end_mhz, FREQ_MIN, FREQ_MAX, "EndMHz");
+    /* Wide sanity clamps only; the Fmax ceiling is applied in main after
+     * the SMU read-back. StartMHz 0 means "start at Fmax" (resolved there). */
+    if (c->start_mhz != 0)
+        c->start_mhz = clamp_int(c->start_mhz, FREQ_FLOOR, FREQ_CEIL, "StartMHz");
+    c->end_mhz   = clamp_int(c->end_mhz, FREQ_FLOOR, FREQ_CEIL, "EndMHz");
     c->step_mhz  = clamp_int(c->step_mhz, 25, 200, "StepMHz");
     c->settle_ms = clamp_int(c->settle_ms, 500, 10000, "SettleMs");
     c->samples   = clamp_int(c->samples, 1, 20, "Samples");
     c->sample_int_ms = clamp_int(c->sample_int_ms, 50, 2000, "SampleIntervalMs");
-    c->load_core = clamp_int(c->load_core, 0, 11, "LoadCore");
+    {
+        /* LoadCore range depends on the CPU (0..nproc-1), not on the 3600's
+         * 12 logical cores. */
+        SYSTEM_INFO si;
+        DWORD nproc;
+        GetSystemInfo(&si);
+        nproc = si.dwNumberOfProcessors;
+        if (nproc == 0) nproc = 1;
+        c->load_core = clamp_int(c->load_core, 0, (int)nproc - 1, "LoadCore");
+    }
     log_msg("config: start=%d end=%d step=%d settle=%dms samples=%d interval=%dms load_core=%d csv=%s",
             c->start_mhz, c->end_mhz, c->step_mhz, c->settle_ms,
             c->samples, c->sample_int_ms, c->load_core, c->csv_path);
@@ -206,14 +250,76 @@ static bool is_admin(void)
     return ok == TRUE;
 }
 
-static int check_cpu(void)
+/* ------------------------------------------------------------------ */
+/* CPU detection + per-family SMU table (0.2.0, copied from            */
+/* zenstates-c.c; the sweep needs BOTH cap commands, so Zen 4 -- which */
+/* has only the all-core one -- is refused here, not just noted)       */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const char *name;
+    uint32_t cmd_set_single;
+    uint32_t cmd_set_all;
+    uint32_t cmd_get_limit;
+    const char *note;
+} FamilyTable;
+
+static const FamilyTable FAM_MATISSE = {
+    "Matisse / Castle Peak (Zen 2)",
+    0x29, 0x2B, 0x6E, NULL
+};
+static const FamilyTable FAM_ZEN3 = {
+    "Vermeer / Chagall / Milan (Zen 3)",
+    0x29, 0x2B, 0x6E,
+    "NOTE: Zen 3 inherits the Zen 2 RSMU table, so 0x29/0x2B are attempted "
+    "but UNVERIFIED on Zen 3. Failures are reported; a failed command applies nothing."
+};
+
+/* Codename lookup for logging and the refuse message (Cpu.cs). NULL if unknown. */
+static const char *codename_for(unsigned int family, unsigned int model)
+{
+    if (family == 0x17) {
+        switch (model) {
+        case 0x01: return "Summit Ridge (Zen 1)";
+        case 0x08: return "Pinnacle Ridge (Zen+)";
+        case 0x11: return "Raven Ridge (Zen 1 APU)";
+        case 0x18: return "Picasso (Zen+ APU)";
+        case 0x31: return "Rome (EPYC) or Castle Peak (Threadripper 3000)";
+        case 0x60: return "Renoir (Zen 2 APU)";
+        case 0x68: return "Lucienne (Zen 2 APU)";
+        case 0x71: return "Matisse (Zen 2)";
+        case 0x90: case 0x91: return "Van Gogh (Zen 2 APU)";
+        case 0x98: return "Mero (Zen 2 APU)";
+        case 0xA0: return "Mendocino (Zen 2 APU)";
+        }
+    } else if (family == 0x19) {
+        switch (model) {
+        case 0x01: return "Milan (Zen 3)";
+        case 0x08: return "Chagall (Zen 3)";
+        case 0x11: return "Genoa (Zen 4)";
+        case 0x18: return "Storm Peak (Zen 4)";
+        case 0x21: return "Vermeer (Zen 3)";
+        case 0x44: return "Rembrandt (Zen 3+ APU)";
+        case 0x50: return "Cezanne (Zen 3 APU)";
+        case 0x61: return "Raphael / Dragon Range (Zen 4)";
+        }
+    } else if (family == 0x1A) {
+        return "Zen 5";
+    }
+    return NULL;
+}
+
+/* Detects the CPU and returns its family table, or NULL (with a logged
+ * reason) when the CPU is not supported by the sweep. */
+static const FamilyTable *detect_cpu(void)
 {
     unsigned int eax, ebx, ecx, edx;
     char vendor[13];
     unsigned int family, model;
+    const char *name;
     if (!__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
         log_msg("ERROR: CPUID leaf 0 failed");
-        return -1;
+        return NULL;
     }
     memcpy(vendor + 0, &ebx, 4);
     memcpy(vendor + 4, &edx, 4);
@@ -221,17 +327,58 @@ static int check_cpu(void)
     vendor[12] = '\0';
     if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
         log_msg("ERROR: CPUID leaf 1 failed");
-        return -1;
+        return NULL;
     }
     family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
     model  = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
+    name = codename_for(family, model);
     log_msg("CPU: vendor=%s family=0x%X model=0x%X (want AuthenticAMD family 0x17 model 0x71 Matisse)",
             vendor, family, model);
-    if (strcmp(vendor, "AuthenticAMD") != 0 || family != 0x17 || model != 0x71) {
-        log_msg("ERROR: refusing to run: this build only supports Ryzen 3000 Matisse (Family 17h Model 71h).");
-        return -1;
+    if (name) log_msg("CPU: %s", name);
+    if (strcmp(vendor, "AuthenticAMD") != 0) {
+        log_msg("ERROR: refusing to run: not an AMD CPU (vendor=%s).", vendor);
+        return NULL;
     }
-    return 0;
+    if (family == 0x17) {
+        switch (model) {
+        case 0x71:
+            return &FAM_MATISSE;
+        case 0x31:
+            log_msg("CPU: Family 17h Model 31h is Rome (EPYC, no cap support) or "
+                    "Castle Peak (Threadripper 3000, Matisse table). Attempting "
+                    "the Matisse table; if the SMU rejects the commands, it is Rome.");
+            return &FAM_MATISSE;
+        default:
+            log_msg("ERROR: refusing to run: %s has no boost-limit command in "
+                    "the sourced ZenStates table, so there is no safe cap to send.",
+                    name ? name : "this CPU");
+            return NULL;
+        }
+    }
+    if (family == 0x19) {
+        switch (model) {
+        case 0x21: case 0x08: case 0x01:
+            return &FAM_ZEN3;
+        case 0x61: case 0x11: case 0x18:
+            /* The sweep needs a single-core cap to constrain the one loaded
+             * core; Zen 4 only has the all-core code (0x70), which cannot
+             * constrain a single-core load. Refusing is the honest answer. */
+            log_msg("ERROR: refusing to run: %s has no single-core boost-limit "
+                    "command in the sourced table (only all-core 0x70), and the "
+                    "sweep needs one to constrain its single-core load. The main "
+                    "program (zenstates-c.exe) does support Zen 4, all-core only.",
+                    name ? name : "this CPU (Zen 4)");
+            return NULL;
+        default:
+            log_msg("ERROR: refusing to run: %s has no boost-limit command in "
+                    "the sourced ZenStates table, so there is no safe cap to send.",
+                    name ? name : "this CPU");
+            return NULL;
+        }
+    }
+    log_msg("ERROR: refusing to run: family 0x%X is not a supported Zen generation "
+            "(Zen 2 / Zen 3 desktop).", family);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -339,10 +486,13 @@ static HANDLE g_msr = INVALID_HANDLE_VALUE;  /* AMDFamily17.bin */
 
 static bool find_module(const char *name, char *out, size_t out_size)
 {
-    snprintf(out, out_size, "%s\\modules\\%s", g_exe_dir, name);
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
-    snprintf(out, out_size, "%s\\%s", g_exe_dir, name);
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
+    /* 1) exe dir \ modules \ name   2) exe dir \ name */
+    char moddir[MAX_PATH];
+    if (path_join(moddir, sizeof(moddir), g_exe_dir, "modules") &&
+        path_join(out, out_size, moddir, name) &&
+        GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
+    if (path_join(out, out_size, g_exe_dir, name) &&
+        GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
     return false;
 }
 
@@ -516,6 +666,9 @@ int main(void)
     int failures = 0;
     int step_count = 0, dir;
     HANDLE hload = NULL;
+    const FamilyTable *fam = NULL;
+    int stock_max = 0;
+    int restore_mhz = 0;
 
     get_exe_dir();
     load_config(&cfg);
@@ -532,10 +685,13 @@ int main(void)
         if (g_log) fclose(g_log);
         return 2;
     }
-    if (check_cpu() != 0) {
+    fam = detect_cpu();
+    if (!fam) {
         if (g_log) fclose(g_log);
         return 2;
     }
+    log_msg("family table: %s", fam->name);
+    if (fam->note) log_msg("%s", fam->note);
 
     if (!find_module("RyzenSMU.bin", smu_bin, sizeof(smu_bin)) ||
         !find_module("AMDFamily17.bin", msr_bin, sizeof(msr_bin))) {
@@ -561,18 +717,47 @@ int main(void)
 
     hwcr_fix();
 
-    /* Baseline: what cap is currently set (0x6E read-back, best effort). */
+    /* Baseline: the 0x6E read-back BEFORE the sweep. This is the stock
+     * boost limit (Fmax) -- the sweep's start (unless the INI sets
+     * StartMHz) and the restore value at the end. Abort before sending
+     * anything if the read fails or is implausible. */
     pci_lock();
     {
-        int64_t in[7] = { 0x6E, 0, 0, 0, 0, 0, 0 };
+        int64_t in[7] = { (int64_t)fam->cmd_get_limit, 0, 0, 0, 0, 0, 0 };
         int64_t out[6] = { 0 };
         int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
-        if (rc == 0)
-            log_msg("baseline: GetBoostLimitFrequency (0x6E) currently reports %lld MHz", (long long)out[0]);
-        else
-            log_msg("WARN: baseline 0x6E read-back failed (win32=%d)", rc);
+        if (rc != 0 || out[0] < FREQ_FLOOR || out[0] > FREQ_CEIL) {
+            log_msg("ERROR: stock boost limit read-back (0x%02X) failed or implausible "
+                    "(win32=%d, value=%lld MHz). Aborting before sending any cap.",
+                    fam->cmd_get_limit, rc, (long long)out[0]);
+            pci_unlock();
+            if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+            if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+            if (g_log) fclose(g_log);
+            return 1;
+        }
+        stock_max = (int)out[0];
+        restore_mhz = stock_max;
+        log_msg("stock boost limit (Fmax, 0x6E read-back) = %d MHz; "
+                "caps will be restored to this value at the end", stock_max);
     }
     pci_unlock();
+
+    /* Resolve the sweep range against Fmax. */
+    if (cfg.start_mhz == 0) {
+        cfg.start_mhz = stock_max;
+        log_msg("sweep start: StartMHz not set, using Fmax %d MHz", stock_max);
+    } else if (cfg.start_mhz > stock_max) {
+        log_msg("WARN: StartMHz=%d above stock max %d; clamping to %d",
+                cfg.start_mhz, stock_max, stock_max);
+        cfg.start_mhz = stock_max;
+    }
+    if (cfg.end_mhz > stock_max) {
+        log_msg("WARN: EndMHz=%d above stock max %d; clamping to %d",
+                cfg.end_mhz, stock_max, stock_max);
+        cfg.end_mhz = stock_max;
+    }
+    log_msg("sweep: start=%d end=%d step=%d", cfg.start_mhz, cfg.end_mhz, cfg.step_mhz);
 
     g_csv = fopen(cfg.csv_path, "w");
     if (!g_csv) {
@@ -604,8 +789,8 @@ int main(void)
             PState ps;
 
             pci_lock();
-            if (smu_send(0x2B, (uint32_t)target) != 0) failures++;
-            if (smu_send(0x29, (uint32_t)target) != 0) failures++;
+            if (smu_send(fam->cmd_set_all, (uint32_t)target) != 0) failures++;
+            if (smu_send(fam->cmd_set_single, (uint32_t)target) != 0) failures++;
             pci_unlock();
             if (failures > 0 && ok_samples == 0 && target == cfg.start_mhz) {
                 /* First step already failed to set the cap; still try to
@@ -651,25 +836,24 @@ int main(void)
     CloseHandle(hload);
     fclose(g_csv);
 
-    /* Restore: both caps back to stock Fmax (4200 MHz = effectively uncapped
-     * for a 3600). If zenstates-c's autostart cap was installed, re-run
-     * zenstates-c.exe afterwards to re-apply it. */
+    /* Restore: both caps back to the value 0x6E reported before the sweep
+     * (the pre-sweep limit). If a cap was installed before the sweep, this
+     * puts it back -- the sweep is non-destructive. */
     pci_lock();
-    if (smu_send(0x2B, STOCK_FMAX_MHZ) != 0) failures++;
-    if (smu_send(0x29, STOCK_FMAX_MHZ) != 0) failures++;
+    if (smu_send(fam->cmd_set_all, (uint32_t)restore_mhz) != 0) failures++;
+    if (smu_send(fam->cmd_set_single, (uint32_t)restore_mhz) != 0) failures++;
     pci_unlock();
 
     if (failures == 0) {
         log_msg("OK: sweep done (%d points), CSV=%s. "
                 "Medians are the measured V/F points. "
-                "Caps restored to %d MHz; if zenstates-c's autostart cap was installed, "
-                "re-run zenstates-c.exe to re-apply it.",
-                step_count, cfg.csv_path, STOCK_FMAX_MHZ);
+                "Caps restored to %d MHz (the pre-sweep limit).",
+                step_count, cfg.csv_path, restore_mhz);
     } else {
         log_msg("DONE WITH %d FAILURE(S) (see above). CSV=%s still holds the "
                 "samples that succeeded; caps were restored to %d MHz as far as "
                 "the SMU accepted it. A reboot restores stock behaviour.",
-                failures, cfg.csv_path, STOCK_FMAX_MHZ);
+                failures, cfg.csv_path, restore_mhz);
     }
     if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
     if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);

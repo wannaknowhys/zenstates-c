@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * zenstates-c.c -- pure C re-implementation of the ZenStates boost-cap path
- * for Ryzen 5 3600 (Matisse, Zen 2, Family 17h Model 71h).
+ * for Ryzen desktop CPUs (Zen 2 / Zen 3 / Zen 4), 0.2.0.
  *
  * What it does (cap, NOT a fixed-frequency lock):
- *   - single-core boost cap -> 4000 MHz (default), all-core boost cap -> 3900 MHz
- *   - PPT/TDC/EDC kept at stock 88 W / 60 A / 90 A (defaults, configurable)
+ *   - single-core boost cap (default 4000 MHz) and all-core boost cap
+ *     (default 3900 MHz), each clamped to the CPU's own stock maximum,
+ *     read back from the SMU at startup (see Fmax below), never assumed.
+ *   - PPT/TDC/EDC are OPTIONAL: sent only when set in the INI. With no
+ *     [Power] keys the power limits are left exactly as the BIOS set
+ *     them. (0.1.0 always sent Ryzen 5 3600 stock 88 W / 60 A / 90 A;
+ *     that default is wrong for other CPUs, so 0.2.0 does not send it.)
  *   - Boost stays dynamic below the cap; idle still downclocks and drops voltage.
  *   - It NEVER writes a fixed frequency, a fixed voltage, or a VID.
  *
@@ -29,6 +34,47 @@
  *   AMDFamily17 module, but treats a failure there as a warning, not fatal
  *   (ZenStates 2.0's core does not do it at all).
  *
+ * Family dispatch (sources: ZenStates-Core 2.0, Hardware/SMU.cs tables
+ * and Cpu.cs codename map; see SLOW_MODE.md for the evidence chain):
+ *   Matisse / Castle Peak (17h/0x71, 17h/0x31) -- Zen2Settings
+ *     0x29 single-core cap, 0x2B all-core cap, PPT 0x53, TDC 0x54, EDC 0x55
+ *   Vermeer / Chagall / Milan (19h/0x21, 0x08, 0x01) -- Zen3Settings
+ *     inherits the Zen 2 RSMU table unchanged, so the same codes are
+ *     attempted. NOTE: 0x29/0x2B on Zen 3 are UNVERIFIED (no source
+ *     evidence either way); failures are reported, nothing is applied
+ *     by a failed command.
+ *   Raphael / Dragon Range / Genoa / Storm Peak (19h/0x61, 0x11, 0x18)
+ *     -- Zen4Settings: all-core cap 0x70 (a real SET code in the 2.0
+ *     source), PPT 0x56, TDC 0x57, EDC 0x58. There is NO single-core cap
+ *     code for Zen 4, so SingleCoreMaxMHz is ignored on these CPUs (logged).
+ *   Zen 1 / Zen+ / Rome / APUs / Zen 5: the sourced tables contain no
+ *     boost-limit command for them, so the program detects the CPU and
+ *     refuses with a reason instead of sending a code that means
+ *     something else (or nothing) on that family.
+ *   Family 17h Model 31h is ambiguous: Rome (EPYC, no cap support) and
+ *   Castle Peak (Threadripper 3000, Matisse table) share the CPUID.
+ *   The Matisse table is attempted; if the SMU rejects the commands,
+ *   that means Rome (nothing was applied, exit 3).
+ *   Mailbox: the RyzenSMU.bin module carries both the Matisse and the
+ *   Zen 1 RSMU mailbox sets and selects its own; Zen 2/3/4 share the
+ *   Matisse mailbox (MSG 0x03B10524 / RSP 0x03B10570 / ARG 0x03B10A40),
+ *   so the module path works for all three. The C code never touches
+ *   these addresses directly -- it only passes cmd + args to the module.
+ *   (0.1.0's 0x29/0x2B came from the OLD ZenStates 0.x Matisse codes,
+ *   restored because ZenStates 2.0's own core does not carry them for
+ *   Matisse any more; the Zen 4 0x70 code comes from the 2.0 source.)
+ *
+ * Fmax (stock maximum, no hardcoded 4200 any more):
+ *   At startup, before sending any cap, the program reads 0x6E
+ *   GetBoostLimitFrequency -- the same call upstream's Cpu.GetFMax()
+ *   uses (Cpu.cs:1867). That value is the ceiling for the INI caps.
+ *   If the read fails or returns an implausible value (< 3000 or
+ *   > 6000 MHz) the program aborts BEFORE sending any SET command
+ *   (exit 1). Note: if a cap from a previous run is still active, 0x6E
+ *   returns the capped value, not the factory maximum -- the ceiling
+ *   then is the current limit, which is still safe (caps only ever go
+ *   down from it).
+ *
  * PawnIO wire format (from ZenStates-Core PawnIo/PawnIo.cs, verified against
  * the decompiled 2.0 binary -- see SLOW_MODE.md):
  *   device: \\\\?\\GLOBALROOT\\Device\\PawnIO, GENERIC_READ|GENERIC_WRITE
@@ -42,14 +88,17 @@
  *   and this program logs it instead of guessing.
  *
  * Safety:
- *   - Refuses to run on any CPU that is not Family 17h Model 71h (Matisse).
+ *   - Refuses to run on CPUs whose sourced SMU table has no boost-limit
+ *     command (Zen 1, Zen+, Rome, APUs, Zen 5): it detects the CPU first
+ *     and says why, instead of sending a code that means something else
+ *     (or nothing) on that family.
  *   - Refuses to run without Administrator rights.
  *   - Every failure is a logged user-mode return. Nothing here can BSOD by
  *     itself; the only kernel work is done by the signed PawnIO driver and
  *     its signed modules, exactly as ZenStates does it.
  *   - No hardware was available in the build VM, so the SMU sequence is
- *     STATICALLY verified only (compile + protocol review). First run on the
- *     real 3600 is a TEST: check HWMonitor max frequency afterwards.
+ *     STATICALLY verified only (compile + protocol review). First run on
+ *     real hardware is a TEST: check HWMonitor max frequency afterwards.
  *
  * Config: zenstates-c.ini next to the exe (see zenstates-c.ini for fields).
  *   Missing file / missing key -> log a warning, use defaults, keep going.
@@ -79,24 +128,30 @@
 #define DEFAULT_TDC_A       60
 #define DEFAULT_EDC_A       90
 
-/* Hard clamps: never let a typo in the INI send a dangerous value. */
-#define SINGLE_MIN 3600
-#define SINGLE_MAX 4200
-#define ALL_MIN    3600
-#define ALL_MAX    4200
+/* Wide sanity clamps: never let a typo in the INI send a dangerous value.
+ * The frequency ceiling is NOT here any more -- it is the Fmax read back
+ * from the SMU at startup (see main); these are only typo guards.
+ * FREQ_FLOOR 3000 MHz is below every supported CPU's stock maximum.
+ * Power ranges cover AM5 stock limits (7950X class: ~200 W PPT) as well
+ * as the 3600's 88/60/90; they are typo guards, not per-CPU stock. */
+#define FREQ_FLOOR 3000
+#define FREQ_CEIL  6000
 #define PPT_MIN    45
-#define PPT_MAX    142
+#define PPT_MAX    300
 #define TDC_MIN    30
-#define TDC_MAX    95
+#define TDC_MAX    200
 #define EDC_MIN    45
-#define EDC_MAX    140
+#define EDC_MAX    300
 
 typedef struct {
     int single_mhz;   /* [Boost] SingleCoreMaxMHz */
     int all_mhz;      /* [Boost] AllCoreMaxMHz    */
-    int ppt_w;        /* [Power] PPT_W            */
-    int tdc_a;        /* [Power] TDC_A            */
-    int edc_a;        /* [Power] EDC_A            */
+    int ppt_w;        /* [Power] PPT_W (only sent if ppt_set) */
+    int tdc_a;        /* [Power] TDC_A (only sent if tdc_set) */
+    int edc_a;        /* [Power] EDC_A (only sent if edc_set) */
+    int ppt_set;      /* [Power] PPT_W was present in the INI */
+    int tdc_set;      /* [Power] TDC_A was present in the INI */
+    int edc_set;      /* [Power] EDC_A was present in the INI */
     int auto_apply;   /* [Startup] AutoApply: read, not acted on by this exe */
     char log_path[MAX_PATH];
     char ini_path[MAX_PATH];
@@ -131,6 +186,20 @@ static int clamp_int(int v, int lo, int hi, const char *name)
     return v;
 }
 
+/* Join dir + "\\" + name into out (size out_size). Returns 1 on success,
+ * 0 if it would not fit (callers fall back to the bare name). This avoids
+ * snprintf("%s\\%s") into a MAX_PATH buffer, which newer gcc flags with
+ * -Wformat-truncation because the directory part can be up to MAX_PATH. */
+static int path_join(char *out, size_t out_size, const char *dir, const char *name)
+{
+    size_t dl = strlen(dir), nl = strlen(name);
+    if (dl + 1 + nl + 1 > out_size) return 0;
+    memcpy(out, dir, dl);
+    out[dl] = '\\';
+    memcpy(out + dl + 1, name, nl + 1);
+    return 1;
+}
+
 static void get_exe_dir(void)
 {
     char path[MAX_PATH];
@@ -150,25 +219,25 @@ static void get_exe_dir(void)
 /* INI path resolution: exe dir first, then %ProgramData%\ZenStates-C. */
 static void resolve_ini_path(Config *c)
 {
-    char cand[MAX_PATH];
-    snprintf(cand, sizeof(cand), "%s\\zenstates-c.ini", g_exe_dir);
-    if (GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+    char cand[MAX_PATH], cand2[MAX_PATH];
+    if (path_join(cand, sizeof(cand), g_exe_dir, "zenstates-c.ini") &&
+        GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
         strcpy(c->ini_path, cand);
         c->ini_found = 1;
         return;
     }
-    if (GetEnvironmentVariableA("ProgramData", cand, sizeof(cand)) > 0) {
-        char cand2[MAX_PATH];
-        snprintf(cand2, sizeof(cand2), "%s\\ZenStates-C\\zenstates-c.ini", cand);
-        if (GetFileAttributesA(cand2) != INVALID_FILE_ATTRIBUTES) {
-            strcpy(c->ini_path, cand2);
-            c->ini_found = 1;
-            return;
-        }
+    if (GetEnvironmentVariableA("ProgramData", cand, sizeof(cand)) > 0 &&
+        path_join(cand2, sizeof(cand2), cand, "ZenStates-C") &&
+        path_join(cand, sizeof(cand), cand2, "zenstates-c.ini") &&
+        GetFileAttributesA(cand) != INVALID_FILE_ATTRIBUTES) {
+        strcpy(c->ini_path, cand);
+        c->ini_found = 1;
+        return;
     }
     /* Not found: point at the exe-dir path anyway so the GUI knows where
        to create it, and run on defaults. */
-    snprintf(c->ini_path, sizeof(c->ini_path), "%s\\zenstates-c.ini", g_exe_dir);
+    if (!path_join(c->ini_path, sizeof(c->ini_path), g_exe_dir, "zenstates-c.ini"))
+        strcpy(c->ini_path, "zenstates-c.ini");
     c->ini_found = 0;
 }
 
@@ -181,14 +250,14 @@ static void load_config(Config *c)
     c->tdc_a      = DEFAULT_TDC_A;
     c->edc_a      = DEFAULT_EDC_A;
     c->auto_apply = 1;
-    snprintf(c->log_path, sizeof(c->log_path), "%s\\zenstates-c.log", g_exe_dir);
+    if (!path_join(c->log_path, sizeof(c->log_path), g_exe_dir, "zenstates-c.log"))
+        strcpy(c->log_path, "zenstates-c.log");
 
     resolve_ini_path(c);
     if (!c->ini_found) {
         log_msg("WARN: no INI found at %s; using defaults "
-                "single=%d all=%d ppt=%d tdc=%d edc=%d",
-                c->ini_path, c->single_mhz, c->all_mhz,
-                c->ppt_w, c->tdc_a, c->edc_a);
+                "single=%d all=%d, power limits untouched",
+                c->ini_path, c->single_mhz, c->all_mhz);
         return;
     }
     log_msg("INI: %s", c->ini_path);
@@ -196,12 +265,24 @@ static void load_config(Config *c)
                                           DEFAULT_SINGLE_MHZ, c->ini_path);
     c->all_mhz    = GetPrivateProfileIntA("Boost", "AllCoreMaxMHz",
                                           DEFAULT_ALL_MHZ, c->ini_path);
-    c->ppt_w      = GetPrivateProfileIntA("Power", "PPT_W",
-                                          DEFAULT_PPT_W, c->ini_path);
-    c->tdc_a      = GetPrivateProfileIntA("Power", "TDC_A",
-                                          DEFAULT_TDC_A, c->ini_path);
-    c->edc_a      = GetPrivateProfileIntA("Power", "EDC_A",
-                                          DEFAULT_EDC_A, c->ini_path);
+    /* Power limits are OPTIONAL (0.2.0): only sent when the key is present
+     * in the INI. Absent keys leave the limit exactly as the BIOS set it.
+     * GetPrivateProfileStringA returns 0 when the key is missing. */
+    {
+        char s[32];
+        if (GetPrivateProfileStringA("Power", "PPT_W", "", s, sizeof(s), c->ini_path) > 0 && s[0]) {
+            c->ppt_set = 1;
+            c->ppt_w = GetPrivateProfileIntA("Power", "PPT_W", DEFAULT_PPT_W, c->ini_path);
+        }
+        if (GetPrivateProfileStringA("Power", "TDC_A", "", s, sizeof(s), c->ini_path) > 0 && s[0]) {
+            c->tdc_set = 1;
+            c->tdc_a = GetPrivateProfileIntA("Power", "TDC_A", DEFAULT_TDC_A, c->ini_path);
+        }
+        if (GetPrivateProfileStringA("Power", "EDC_A", "", s, sizeof(s), c->ini_path) > 0 && s[0]) {
+            c->edc_set = 1;
+            c->edc_a = GetPrivateProfileIntA("Power", "EDC_A", DEFAULT_EDC_A, c->ini_path);
+        }
+    }
     c->auto_apply = GetPrivateProfileIntA("Startup", "AutoApply",
                                           1, c->ini_path);
     {
@@ -210,18 +291,26 @@ static void load_config(Config *c)
                                      lp, sizeof(lp), c->ini_path) > 0 && lp[0])
             strcpy(c->log_path, lp);
     }
-    c->single_mhz = clamp_int(c->single_mhz, SINGLE_MIN, SINGLE_MAX, "SingleCoreMaxMHz");
-    c->all_mhz    = clamp_int(c->all_mhz, ALL_MIN, ALL_MAX, "AllCoreMaxMHz");
+    /* Wide sanity clamps only; the Fmax ceiling is applied in main after
+     * the SMU read-back. */
+    c->single_mhz = clamp_int(c->single_mhz, FREQ_FLOOR, FREQ_CEIL, "SingleCoreMaxMHz");
+    c->all_mhz    = clamp_int(c->all_mhz, FREQ_FLOOR, FREQ_CEIL, "AllCoreMaxMHz");
     if (c->all_mhz > c->single_mhz) {
         log_msg("WARN: AllCoreMaxMHz (%d) > SingleCoreMaxMHz (%d); clamping all-core to single-core",
                 c->all_mhz, c->single_mhz);
         c->all_mhz = c->single_mhz;
     }
-    c->ppt_w = clamp_int(c->ppt_w, PPT_MIN, PPT_MAX, "PPT_W");
-    c->tdc_a = clamp_int(c->tdc_a, TDC_MIN, TDC_MAX, "TDC_A");
-    c->edc_a = clamp_int(c->edc_a, EDC_MIN, EDC_MAX, "EDC_A");
-    log_msg("config: single=%d MHz all=%d MHz ppt=%d W tdc=%d A edc=%d A auto_apply=%d",
-            c->single_mhz, c->all_mhz, c->ppt_w, c->tdc_a, c->edc_a, c->auto_apply);
+    if (c->ppt_set) c->ppt_w = clamp_int(c->ppt_w, PPT_MIN, PPT_MAX, "PPT_W");
+    if (c->tdc_set) c->tdc_a = clamp_int(c->tdc_a, TDC_MIN, TDC_MAX, "TDC_A");
+    if (c->edc_set) c->edc_a = clamp_int(c->edc_a, EDC_MIN, EDC_MAX, "EDC_A");
+    {
+        char pb[32], tb[32], eb[32];
+        if (c->ppt_set) snprintf(pb, sizeof(pb), "%d W", c->ppt_w); else strcpy(pb, "untouched");
+        if (c->tdc_set) snprintf(tb, sizeof(tb), "%d A", c->tdc_a); else strcpy(tb, "untouched");
+        if (c->edc_set) snprintf(eb, sizeof(eb), "%d A", c->edc_a); else strcpy(eb, "untouched");
+        log_msg("config: single=%d MHz all=%d MHz ppt=%s tdc=%s edc=%s auto_apply=%d",
+                c->single_mhz, c->all_mhz, pb, tb, eb, c->auto_apply);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -241,15 +330,86 @@ static bool is_admin(void)
     return ok == TRUE;
 }
 
-/* Returns 0 on Matisse, else -1. Also logs CPUID. */
-static int check_cpu(void)
+/* ------------------------------------------------------------------ */
+/* CPU detection + per-family SMU table (0.2.0)                        */
+/* ------------------------------------------------------------------ */
+
+/* One row per supported family. cmd_* = 0 means "no such command in the
+ * sourced table". Sources: ZenStates-Core 2.0 Hardware/SMU.cs tables
+ * (Zen2Settings / Zen3Settings / Zen4Settings) and Cpu.cs codename map. */
+typedef struct {
+    const char *name;        /* e.g. "Matisse (Zen 2)" */
+    uint32_t cmd_set_single; /* single-core boost cap, 0 = none */
+    uint32_t cmd_set_all;    /* all-core boost cap, 0 = none */
+    uint32_t cmd_ppt;
+    uint32_t cmd_tdc;
+    uint32_t cmd_edc;
+    uint32_t cmd_get_limit;  /* 0x6E read-back */
+    const char *note;        /* printed at startup, may be NULL */
+} FamilyTable;
+
+static const FamilyTable FAM_MATISSE = {
+    "Matisse / Castle Peak (Zen 2)",
+    0x29, 0x2B, 0x53, 0x54, 0x55, 0x6E, NULL
+};
+static const FamilyTable FAM_ZEN3 = {
+    "Vermeer / Chagall / Milan (Zen 3)",
+    0x29, 0x2B, 0x53, 0x54, 0x55, 0x6E,
+    "NOTE: Zen 3 inherits the Zen 2 RSMU table, so 0x29/0x2B are attempted "
+    "but UNVERIFIED on Zen 3. Failures are reported; a failed command applies nothing."
+};
+static const FamilyTable FAM_ZEN4 = {
+    "Raphael / Dragon Range / Genoa / Storm Peak (Zen 4)",
+    0, 0x70, 0x56, 0x57, 0x58, 0x6E,
+    "NOTE: Zen 4 has no single-core boost-limit command in the sourced table "
+    "(only all-core 0x70); SingleCoreMaxMHz is ignored on this CPU."
+};
+
+/* Codename lookup for logging and the refuse message (Cpu.cs). NULL if unknown. */
+static const char *codename_for(unsigned int family, unsigned int model)
+{
+    if (family == 0x17) {
+        switch (model) {
+        case 0x01: return "Summit Ridge (Zen 1)";
+        case 0x08: return "Pinnacle Ridge (Zen+)";
+        case 0x11: return "Raven Ridge (Zen 1 APU)";
+        case 0x18: return "Picasso (Zen+ APU)";
+        case 0x31: return "Rome (EPYC) or Castle Peak (Threadripper 3000)";
+        case 0x60: return "Renoir (Zen 2 APU)";
+        case 0x68: return "Lucienne (Zen 2 APU)";
+        case 0x71: return "Matisse (Zen 2)";
+        case 0x90: case 0x91: return "Van Gogh (Zen 2 APU)";
+        case 0x98: return "Mero (Zen 2 APU)";
+        case 0xA0: return "Mendocino (Zen 2 APU)";
+        }
+    } else if (family == 0x19) {
+        switch (model) {
+        case 0x01: return "Milan (Zen 3)";
+        case 0x08: return "Chagall (Zen 3)";
+        case 0x11: return "Genoa (Zen 4)";
+        case 0x18: return "Storm Peak (Zen 4)";
+        case 0x21: return "Vermeer (Zen 3)";
+        case 0x44: return "Rembrandt (Zen 3+ APU)";
+        case 0x50: return "Cezanne (Zen 3 APU)";
+        case 0x61: return "Raphael / Dragon Range (Zen 4)";
+        }
+    } else if (family == 0x1A) {
+        return "Zen 5";
+    }
+    return NULL;
+}
+
+/* Detects the CPU and returns its family table, or NULL (with a logged
+ * reason) when the CPU is not supported. Also logs the CPUID. */
+static const FamilyTable *detect_cpu(void)
 {
     unsigned int eax, ebx, ecx, edx;
     char vendor[13];
     unsigned int family, model;
+    const char *name;
     if (!__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
         log_msg("ERROR: CPUID leaf 0 failed");
-        return -1;
+        return NULL;
     }
     memcpy(vendor + 0, &ebx, 4);
     memcpy(vendor + 4, &edx, 4);
@@ -257,18 +417,53 @@ static int check_cpu(void)
     vendor[12] = '\0';
     if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
         log_msg("ERROR: CPUID leaf 1 failed");
-        return -1;
+        return NULL;
     }
     family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
     model  = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
-    log_msg("CPU: vendor=%s family=0x%X model=0x%X cpuid=0x%08X (want AuthenticAMD family 0x17 model 0x71 Matisse)",
+    name = codename_for(family, model);
+    log_msg("CPU: vendor=%s family=0x%X model=0x%X cpuid=0x%08X",
             vendor, family, model, eax);
-    if (strcmp(vendor, "AuthenticAMD") != 0 || family != 0x17 || model != 0x71) {
-        log_msg("ERROR: refusing to run: this build only supports Ryzen 3000 Matisse (Family 17h Model 71h, e.g. Ryzen 5 3600). "
-                "The SMU message codes below are Matisse-specific; sending them to another CPU could misbehave.");
-        return -1;
+    if (name) log_msg("CPU: %s", name);
+    if (strcmp(vendor, "AuthenticAMD") != 0) {
+        log_msg("ERROR: refusing to run: not an AMD CPU (vendor=%s).", vendor);
+        return NULL;
     }
-    return 0;
+    if (family == 0x17) {
+        switch (model) {
+        case 0x71:
+            return &FAM_MATISSE;
+        case 0x31:
+            /* Rome (EPYC) or Castle Peak (Threadripper 3000): same CPUID,
+             * package type would tell them apart. Attempt the Matisse
+             * table; Rome's SMU has no such commands and will reject them. */
+            log_msg("CPU: Family 17h Model 31h is Rome (EPYC, no cap support) or "
+                    "Castle Peak (Threadripper 3000, Matisse table). Attempting "
+                    "the Matisse table; if the SMU rejects the commands, it is Rome.");
+            return &FAM_MATISSE;
+        default:
+            log_msg("ERROR: refusing to run: %s has no boost-limit command in "
+                    "the sourced ZenStates table, so there is no safe cap to send.",
+                    name ? name : "this CPU");
+            return NULL;
+        }
+    }
+    if (family == 0x19) {
+        switch (model) {
+        case 0x21: case 0x08: case 0x01:
+            return &FAM_ZEN3;
+        case 0x61: case 0x11: case 0x18:
+            return &FAM_ZEN4;
+        default:
+            log_msg("ERROR: refusing to run: %s has no boost-limit command in "
+                    "the sourced ZenStates table, so there is no safe cap to send.",
+                    name ? name : "this CPU");
+            return NULL;
+        }
+    }
+    log_msg("ERROR: refusing to run: family 0x%X is not a supported Zen generation "
+            "(Zen 2 / Zen 3 / Zen 4 desktop).", family);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -388,10 +583,12 @@ static HANDLE g_msr = INVALID_HANDLE_VALUE;  /* AMDFamily17.bin */
 static bool find_module(const char *name, char *out, size_t out_size)
 {
     /* 1) exe dir \ modules \ name   2) exe dir \ name */
-    snprintf(out, out_size, "%s\\modules\\%s", g_exe_dir, name);
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
-    snprintf(out, out_size, "%s\\%s", g_exe_dir, name);
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
+    char moddir[MAX_PATH];
+    if (path_join(moddir, sizeof(moddir), g_exe_dir, "modules") &&
+        path_join(out, out_size, moddir, name) &&
+        GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
+    if (path_join(out, out_size, g_exe_dir, name) &&
+        GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return true;
     return false;
 }
 
@@ -512,6 +709,8 @@ int main(void)
     char smu_bin[MAX_PATH], msr_bin[MAX_PATH];
     uint32_t smu_ver = 0;
     int failures = 0;
+    const FamilyTable *fam = NULL;
+    int stock_max = 0;
 
     get_exe_dir();
     /* Log file is opened after the INI is read in a second pass below;
@@ -531,10 +730,13 @@ int main(void)
         if (g_log) fclose(g_log);
         return 2;
     }
-    if (check_cpu() != 0) {
+    fam = detect_cpu();
+    if (!fam) {
         if (g_log) fclose(g_log);
         return 2;
     }
+    log_msg("family table: %s", fam->name);
+    if (fam->note) log_msg("%s", fam->note);
 
     if (!find_module("RyzenSMU.bin", smu_bin, sizeof(smu_bin)) ||
         !find_module("AMDFamily17.bin", msr_bin, sizeof(msr_bin))) {
@@ -560,26 +762,84 @@ int main(void)
 
     hwcr_fix();
 
+    /* Fmax: read the stock boost limit BEFORE sending any cap. This is the
+     * ceiling for the INI caps; upstream's Cpu.GetFMax() is the same 0x6E
+     * call. Abort before sending anything if it fails or is implausible. */
     pci_lock();
-    /* Order: all-core cap first, then single-core cap, then power limits.
-     * All of these are RSMU commands on Matisse; the RyzenSMU module only
-     * supports the RSMU mailbox, which is exactly what these codes need. */
-    if (smu_send(0x2B, (uint32_t)cfg.all_mhz) != 0) failures++;    /* all-core boost cap */
-    if (smu_send(0x29, (uint32_t)cfg.single_mhz) != 0) failures++; /* single-core boost cap */
-    if (smu_send(0x53, (uint32_t)cfg.ppt_w * 1000u) != 0) failures++; /* PPT, mW */
-    if (smu_send(0x54, (uint32_t)cfg.tdc_a * 1000u) != 0) failures++; /* TDC, mA */
-    if (smu_send(0x55, (uint32_t)cfg.edc_a * 1000u) != 0) failures++; /* EDC, mA */
+    {
+        int64_t in[7] = { (int64_t)fam->cmd_get_limit, 0, 0, 0, 0, 0, 0 };
+        int64_t out[6] = { 0 };
+        int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
+        if (rc != 0 || out[0] < FREQ_FLOOR || out[0] > FREQ_CEIL) {
+            log_msg("ERROR: stock boost limit read-back (0x%02X) failed or implausible "
+                    "(win32=%d, value=%lld MHz). Aborting before sending any cap.",
+                    fam->cmd_get_limit, rc, (long long)out[0]);
+            pci_unlock();
+            if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+            if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+            if (g_log) fclose(g_log);
+            return 1;
+        }
+        stock_max = (int)out[0];
+        log_msg("stock boost limit (Fmax, 0x6E read-back) = %d MHz", stock_max);
+    }
+
+    /* Ceiling pass: clamp the INI caps to [FREQ_FLOOR, stock_max]. */
+    if (cfg.single_mhz > stock_max) {
+        log_msg("WARN: SingleCoreMaxMHz=%d above stock max %d; clamping to %d",
+                cfg.single_mhz, stock_max, stock_max);
+        cfg.single_mhz = stock_max;
+    }
+    if (cfg.all_mhz > stock_max) {
+        log_msg("WARN: AllCoreMaxMHz=%d above stock max %d; clamping to %d",
+                cfg.all_mhz, stock_max, stock_max);
+        cfg.all_mhz = stock_max;
+    }
+    if (cfg.all_mhz > cfg.single_mhz) {
+        log_msg("WARN: AllCoreMaxMHz (%d) > SingleCoreMaxMHz (%d); clamping all-core to single-core",
+                cfg.all_mhz, cfg.single_mhz);
+        cfg.all_mhz = cfg.single_mhz;
+    }
+    log_msg("caps to apply: single<=%d MHz, all-core<=%d MHz (stock max %d MHz)",
+            cfg.single_mhz, cfg.all_mhz, stock_max);
+
+    /* Order: all-core cap first, then single-core cap, then power limits
+     * (only the ones set in the INI). All are RSMU commands; the
+     * RyzenSMU module only supports the RSMU mailbox, which is exactly
+     * what these codes need. */
+    if (smu_send(fam->cmd_set_all, (uint32_t)cfg.all_mhz) != 0) failures++;    /* all-core boost cap */
+    if (fam->cmd_set_single != 0) {
+        if (smu_send(fam->cmd_set_single, (uint32_t)cfg.single_mhz) != 0) failures++; /* single-core boost cap */
+    } else {
+        log_msg("single-core cap skipped: no single-core boost-limit command for %s; "
+                "SingleCoreMaxMHz is ignored on this CPU", fam->name);
+    }
+    if (cfg.ppt_set) {
+        if (smu_send(fam->cmd_ppt, (uint32_t)cfg.ppt_w * 1000u) != 0) failures++; /* PPT, mW */
+    } else {
+        log_msg("PPT left untouched (PPT_W not set in the INI)");
+    }
+    if (cfg.tdc_set) {
+        if (smu_send(fam->cmd_tdc, (uint32_t)cfg.tdc_a * 1000u) != 0) failures++; /* TDC, mA */
+    } else {
+        log_msg("TDC left untouched (TDC_A not set in the INI)");
+    }
+    if (cfg.edc_set) {
+        if (smu_send(fam->cmd_edc, (uint32_t)cfg.edc_a * 1000u) != 0) failures++; /* EDC, mA */
+    } else {
+        log_msg("EDC left untouched (EDC_A not set in the INI)");
+    }
 
     /* Verification read-back (best effort, do not fail the run on it):
-     * 0x6E GetBoostLimitFrequency. Unconfirmed on Matisse whether it
-     * returns the single-core or the all-core limit, so log it, don't judge. */
+     * 0x6E GetBoostLimitFrequency. Unconfirmed whether it returns the
+     * single-core or the all-core limit, so log it, don't judge. */
     {
-        int64_t in[7] = { 0x6E, 0, 0, 0, 0, 0, 0 };
+        int64_t in[7] = { (int64_t)fam->cmd_get_limit, 0, 0, 0, 0, 0, 0 };
         int64_t out[6] = { 0 };
         int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
         if (rc == 0)
             log_msg("verify: GetBoostLimitFrequency (0x6E) returned %lld MHz "
-                    "(expect ~%d; which limit this reports on Matisse is unconfirmed)",
+                    "(expect ~%d; which limit this reports is unconfirmed)",
                     (long long)out[0], cfg.all_mhz);
         else
             log_msg("WARN: verify read-back 0x6E failed (win32=%d); check HWMonitor instead", rc);
@@ -587,12 +847,18 @@ int main(void)
     pci_unlock();
 
     if (failures == 0) {
-        log_msg("OK: boost cap applied: single<=%d MHz, all-core<=%d MHz, "
-                "PPT=%d W TDC=%d A EDC=%d A. Boost stays dynamic below the cap; "
-                "verify in HWMonitor (max core clock should stop at ~%d MHz, "
-                "max VID should drop below ~1.45 V).",
-                cfg.single_mhz, cfg.all_mhz, cfg.ppt_w, cfg.tdc_a, cfg.edc_a,
-                cfg.single_mhz);
+        if (fam->cmd_set_single != 0) {
+            log_msg("OK: boost cap applied on %s: single<=%d MHz, all-core<=%d MHz. "
+                    "Boost stays dynamic below the cap; verify in HWMonitor "
+                    "(max core clock should stop at ~%d MHz).",
+                    fam->name, cfg.single_mhz, cfg.all_mhz, cfg.single_mhz);
+        } else {
+            log_msg("OK: all-core boost cap applied on %s: all-core<=%d MHz "
+                    "(no single-core cap command exists for this family). "
+                    "Boost stays dynamic below the cap; verify in HWMonitor "
+                    "(max core clock should stop at ~%d MHz).",
+                    fam->name, cfg.all_mhz, cfg.all_mhz);
+        }
     } else {
         log_msg("DONE WITH %d FAILED SMU COMMAND(S) (see above). "
                 "The CPU was left in whatever state the successful commands set; "
