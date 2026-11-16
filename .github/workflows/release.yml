@@ -1,0 +1,82 @@
+# Release: when a tag like v1.0.0 is pushed, build all three exes on
+# Windows, pack everything a user needs into one zip, and attach it to
+# a GitHub Release so it can be downloaded directly from the Releases page.
+#
+# Usage:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#   -> Actions runs this workflow -> a Release named v1.0.0 appears with
+#      zenstates-c-v1.0.0-windows-x64.zip attached (plus SHA256SUMS).
+#
+# No secrets are hardcoded here. softprops/action-gh-release uses the
+# built-in ${{ secrets.GITHUB_TOKEN }} (via `token:` below, which is
+# the default and may be omitted). Do NOT add personal tokens.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+
+      - name: Build
+        shell: msys2 {0}
+        run: ./build.sh
+
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $stage = "dist/zenstates-c-$tag-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe, zenstates-c.ini, zenstates-vf.ini, README.md, README.zh-CN.md, LICENSE, ATTRIBUTION.md, install-autostart.bat, uninstall-autostart.bat -Destination $stage
+          Copy-Item -Recurse modules -Destination "$stage/modules"
+          Get-ChildItem -Recurse $stage | Format-Table FullName, Length
+
+      - name: Create zip + checksums
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $stage = "dist/zenstates-c-$tag-windows-x64"
+          $zip = "dist/zenstates-c-$tag-windows-x64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          "$hash  zenstates-c-$tag-windows-x64.zip" | Out-File -Encoding ascii dist/SHA256SUMS
+          Get-Item $zip | Format-Table Name, Length
+          Get-Content dist/SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            dist/zenstates-c-${{ github.ref_name }}-windows-x64.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            ZenStates-C ${{ github.ref_name }} — pure C Boost cap for Ryzen 3000 series desktop CPUs (Zen 2 / Matisse). A cap, not a fixed-frequency lock.
+
+            Download `zenstates-c-${{ github.ref_name }}-windows-x64.zip`, extract it to any folder (keep all files together), and follow README.md.
+            Requires the PawnIO driver (https://pawnio.eu/) — NOT included in this zip.
+
+            Contents: zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe (V/F sweep), zenstates-c.ini, zenstates-vf.ini, modules/ (signed LGPL PawnIO modules), README.md, README.zh-CN.md, LICENSE (GPLv3), ATTRIBUTION.md, install/uninstall-autostart.bat.
+
+            ⚠️ First run on real hardware is a TEST: verify with HWMonitor that max frequency stops at ~4000 MHz. See README.md "Verify".

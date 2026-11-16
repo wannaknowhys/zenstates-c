@@ -1,0 +1,62 @@
+# CI: build check on every push / PR.
+# Builds all three exes on Windows with MinGW-w64 UCRT64 (the same
+# toolchain family as build.bat), then uploads them as a workflow
+# artifact for inspection.
+# Nothing here runs the binaries: they refuse to run on any CPU that is
+# not a Ryzen 3000 series desktop CPU (Family 17h Model 71h), and CI
+# runners are not.
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+
+      - name: Build
+        shell: msys2 {0}
+        run: ./build.sh
+
+      - name: Verify outputs
+        shell: pwsh
+        run: |
+          Get-ChildItem zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe | Format-Table Name, Length
+          (Get-FileHash zenstates-c.exe -Algorithm SHA256).Hash
+          (Get-FileHash zenstates-c-gui.exe -Algorithm SHA256).Hash
+          (Get-FileHash zenstates-vf.exe -Algorithm SHA256).Hash
+          # Manifest sanity: main exe and VF exe must require Administrator, GUI must not.
+          # (Read bytes as ASCII: binary-safe, never throws on invalid UTF-8.)
+          $main = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-c.exe"))
+          if ($main -notmatch "requireAdministrator") { throw "zenstates-c.exe manifest missing requireAdministrator" }
+          $vf = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-vf.exe"))
+          if ($vf -notmatch "requireAdministrator") { throw "zenstates-vf.exe manifest missing requireAdministrator" }
+          $gui = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-c-gui.exe"))
+          if ($gui -notmatch "asInvoker") { throw "zenstates-c-gui.exe manifest missing asInvoker" }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: zenstates-c-windows-x64
+          path: |
+            zenstates-c.exe
+            zenstates-c-gui.exe
+          if-no-files-found: error
