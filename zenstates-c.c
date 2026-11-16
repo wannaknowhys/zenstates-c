@@ -1,6 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * zenstates-c.c -- pure C re-implementation of the ZenStates boost-cap path
- * for Ryzen desktop CPUs (Zen 2 / Zen 3 / Zen 4), 0.2.0.
+ * for Ryzen desktop CPUs (Zen 2 / Zen 3 / Zen 4), 0.2.2.
+ *
+ * Modes:
+ *   (no args)  Apply the INI config (the boost cap + optional power limits).
+ *   --read     Read-only: read the current config from the CPU (HSMP socket
+ *              cap + fused stock max) and write it into the INI, then exit
+ *              without applying anything. Boost keys get the current socket
+ *              cap; Power keys are written as EMPTY entries, because the
+ *              currently-applied PPT/TDC/EDC cannot be read back on Zen 2
+ *              (no Get command in the sourced table) -- an empty entry
+ *              means "unset" (left as the BIOS set them), and both the main
+ *              program and the GUI treat an empty value as absent.
  *
  * What it does (cap, NOT a fixed-frequency lock):
  *   - single-core boost cap (default 4000 MHz) and all-core boost cap
@@ -14,21 +25,34 @@
  *   - It NEVER writes a fixed frequency, a fixed voltage, or a VID.
  *
  * How it works (see SLOW_MODE.md for the evidence chain):
+ *   0.2.1 changed the cap transport: the RSMU boost-limit SET commands
+ *   (0x29/0x2B, restored from old ZenStates 0.x) are REJECTED by SMU
+ *   firmware 46.73.0 on a Ryzen 5 3600 (win32=1359, and a 0x6E read-back
+ *   proves the limit never moved). But Ryzen Master CAN set an all-core
+ *   cap on Zen 2, so the working path is a THIRD mailbox this project
+ *   had never tried: HSMP (Host System Management Port).
  *   PawnIO driver -> load RyzenSMU.bin / AMDFamily17.bin modules ->
- *   ioctl_send_smu_command (RSMU mailbox) with the OLD ZenStates 0.x
- *   Matisse message codes. ZenStates 2.0's own core does NOT carry these
- *   codes for Matisse any more (SetFMax is a dead end there, cmd 0 ->
- *   UNKNOWN_CMD), so this program restores them from the 0.x source
- *   (Zen2CPUSettings, tag 2.0-beta / commit d35a93bb):
- *     RSMU MSG 0x03B10524, RSP 0x03B10570, ARG 0x03B10A40   (module-internal,
- *       handled inside RyzenSMU.bin; the C code never touches these addresses
- *       directly -- it only passes cmd + args to the module)
- *     0x29  SetBoostLimitFrequency         (single-core cap, arg = MHz)
- *     0x2B  SetBoostLimitFrequencyAllCores (all-core cap,    arg = MHz)
+ *   the generic mailbox protocol (SMU.cs SendSmuCommand) re-implemented
+ *   in C over the module's raw register read/write
+ *   (ioctl_read_smu_register / ioctl_write_smu_register), against the
+ *   HSMP mailbox (Zen 2/3/4: MSG 0x3B10534, RSP 0x3B10980, ARG 0x3B109E0):
+ *     0x3  GetInterfaceVersion      (HSMP exists? returns version, 2 on Matisse)
+ *     0x9  SetBoostLimitSocket      (socket-wide cap, arg = MHz) -- THE cap
+ *     0xA  GetBoostLimit            (arg = APIC ID, returns limit in MHz)
+ *     0x8  SetBoostLimit            (per-core cap, arg = apic<<16 | MHz; NOT used)
+ *   (Linux kernel amd_hsmp.h; ZenStates-Core HSMPMailbox.cs. Verified
+ *   2026-11-16 on a Ryzen 5 3600: interface version 2, set 4000 MHz,
+ *   HSMP read-back 4000 MHz, CPU caps at ~4000 MHz in HWMonitor.)
+ *   HSMP provides a SINGLE socket-wide cap, so the two INI values collapse
+ *   to one effective cap: min(SingleCoreMaxMHz, AllCoreMaxMHz). The
+ *   single/all-core distinction of the RSMU era does not exist in HSMP.
+ *   Power limits still go over RSMU DPTC (unchanged, OPTIONAL):
  *     0x53  SetFastLimit / PPT             (arg = mW)
  *     0x54  SetTDCVDDLimit                 (arg = mA)
  *     0x55  SetEDCVDDLimit                 (arg = mA)
- *     0x6E  GetBoostLimitFrequency         (verification read-back, best effort)
+ *   and 0x6E GetBoostLimitFrequency is still the stock-max (Fmax) read:
+ *   it reads the FUSED max, which the HSMP socket cap does NOT change,
+ *   so it stays the correct ceiling even when a cap is already active.
  *   Old code also set MSR_HWCR (0xC0010015) bit 21 on every thread before
  *   sending the boost-limit commands; this program does the same via the
  *   AMDFamily17 module, but treats a failure there as a warning, not fatal
@@ -36,33 +60,33 @@
  *
  * Family dispatch (sources: ZenStates-Core 2.0, Hardware/SMU.cs tables
  * and Cpu.cs codename map; see SLOW_MODE.md for the evidence chain):
+ *   The boost cap is HSMP for every supported family (same mailbox and
+ *   same 0x9 message on Zen 2/3/4). The RSMU cap codes are gone:
+ *   0x29/0x2B are rejected on current firmware and Zen 4's RSMU 0x70 is
+ *   no longer needed. Power limits still use the per-family RSMU DPTC
+ *   codes (PPT/TDC/EDC), and 0x6E is still the stock-max read.
  *   Matisse / Castle Peak (17h/0x71, 17h/0x31) -- Zen2Settings
- *     0x29 single-core cap, 0x2B all-core cap, PPT 0x53, TDC 0x54, EDC 0x55
+ *     HSMP cap 0x9; PPT 0x53, TDC 0x54, EDC 0x55. Verified on a 3600.
  *   Vermeer / Chagall / Milan (19h/0x21, 0x08, 0x01) -- Zen3Settings
- *     inherits the Zen 2 RSMU table unchanged, so the same codes are
- *     attempted. NOTE: 0x29/0x2B on Zen 3 are UNVERIFIED (no source
- *     evidence either way); failures are reported, nothing is applied
- *     by a failed command.
+ *     HSMP cap 0x9; PPT 0x53, TDC 0x54, EDC 0x55. HSMP on Zen 3 is
+ *     UNVERIFIED (same mailbox/messages as Zen 2, but never run there);
+ *     the interface-version gate decides at runtime.
  *   Raphael / Dragon Range / Genoa / Storm Peak (19h/0x61, 0x11, 0x18)
- *     -- Zen4Settings: all-core cap 0x70 (a real SET code in the 2.0
- *     source), PPT 0x56, TDC 0x57, EDC 0x58. There is NO single-core cap
- *     code for Zen 4, so SingleCoreMaxMHz is ignored on these CPUs (logged).
- *   Zen 1 / Zen+ / Rome / APUs / Zen 5: the sourced tables contain no
- *     boost-limit command for them, so the program detects the CPU and
- *     refuses with a reason instead of sending a code that means
- *     something else (or nothing) on that family.
- *   Family 17h Model 31h is ambiguous: Rome (EPYC, no cap support) and
- *   Castle Peak (Threadripper 3000, Matisse table) share the CPUID.
- *   The Matisse table is attempted; if the SMU rejects the commands,
- *   that means Rome (nothing was applied, exit 3).
- *   Mailbox: the RyzenSMU.bin module carries both the Matisse and the
- *   Zen 1 RSMU mailbox sets and selects its own; Zen 2/3/4 share the
- *   Matisse mailbox (MSG 0x03B10524 / RSP 0x03B10570 / ARG 0x03B10A40),
- *   so the module path works for all three. The C code never touches
- *   these addresses directly -- it only passes cmd + args to the module.
- *   (0.1.0's 0x29/0x2B came from the OLD ZenStates 0.x Matisse codes,
- *   restored because ZenStates 2.0's own core does not carry them for
- *   Matisse any more; the Zen 4 0x70 code comes from the 2.0 source.)
+ *     -- Zen4Settings: HSMP cap 0x9; PPT 0x56, TDC 0x57, EDC 0x58.
+ *     HSMP on Zen 4 is UNVERIFIED too.
+ *   Zen 1 / Zen+ / Rome / APUs / Zen 5: the sourced tables configure no
+ *   HSMP mailbox for them, so the program detects the CPU and refuses
+ *   with a reason instead of sending a code that means something else
+ *   (or nothing) on that family. (Zen 5 uses a different HSMP MSG
+ *   address, 0x3B10934, and is refused for that reason.)
+ *   Family 17h Model 31h is ambiguous: Rome (EPYC) and Castle Peak
+ *   (Threadripper 3000) share the CPUID. The Matisse table is attempted;
+ *   the HSMP interface-version gate decides: if the SMU does not
+ *   implement HSMP, the program stops before setting anything (exit 3).
+ *   Mailbox: the HSMP addresses (MSG 0x3B10534 / RSP 0x3B10980 /
+ *   ARG 0x3B109E0) are driven by the generic protocol in this file over
+ *   the module's raw register read/write -- the C code DOES touch these
+ *   addresses (unlike the old RSMU path, where the module hid them).
  *
  * Fmax (stock maximum, no hardcoded 4200 any more):
  *   At startup, before sending any cap, the program reads 0x6E
@@ -70,10 +94,9 @@
  *   uses (Cpu.cs:1867). That value is the ceiling for the INI caps.
  *   If the read fails or returns an implausible value (< 3000 or
  *   > 6000 MHz) the program aborts BEFORE sending any SET command
- *   (exit 1). Note: if a cap from a previous run is still active, 0x6E
- *   returns the capped value, not the factory maximum -- the ceiling
- *   then is the current limit, which is still safe (caps only ever go
- *   down from it).
+ *   (exit 1). 0x6E reads the FUSED max, which the HSMP socket cap does
+ *   NOT change -- so unlike the old RSMU cap, the ceiling stays the
+ *   factory max even when a cap from a previous run is still active.
  *
  * PawnIO wire format (from ZenStates-Core PawnIo/PawnIo.cs, verified against
  * the decompiled 2.0 binary -- see SLOW_MODE.md):
@@ -334,35 +357,36 @@ static bool is_admin(void)
 /* CPU detection + per-family SMU table (0.2.0)                        */
 /* ------------------------------------------------------------------ */
 
-/* One row per supported family. cmd_* = 0 means "no such command in the
- * sourced table". Sources: ZenStates-Core 2.0 Hardware/SMU.cs tables
- * (Zen2Settings / Zen3Settings / Zen4Settings) and Cpu.cs codename map. */
+/* One row per supported family. The boost cap is HSMP 0x9 (socket-wide)
+ * for every supported family, so there is no per-family cap command in
+ * this table any more. cmd_ppt/tdc/edc are the RSMU DPTC power codes
+ * (still RSMU, still OPTIONAL). cmd_get_limit (0x6E) reads the fused
+ * stock max. Sources: ZenStates-Core 2.0 Hardware/SMU.cs tables and
+ * Cpu.cs codename map. */
 typedef struct {
     const char *name;        /* e.g. "Matisse (Zen 2)" */
-    uint32_t cmd_set_single; /* single-core boost cap, 0 = none */
-    uint32_t cmd_set_all;    /* all-core boost cap, 0 = none */
     uint32_t cmd_ppt;
     uint32_t cmd_tdc;
     uint32_t cmd_edc;
-    uint32_t cmd_get_limit;  /* 0x6E read-back */
+    uint32_t cmd_get_limit;  /* 0x6E: fused stock max (ceiling) */
     const char *note;        /* printed at startup, may be NULL */
 } FamilyTable;
 
 static const FamilyTable FAM_MATISSE = {
     "Matisse / Castle Peak (Zen 2)",
-    0x29, 0x2B, 0x53, 0x54, 0x55, 0x6E, NULL
+    0x53, 0x54, 0x55, 0x6E, NULL
 };
 static const FamilyTable FAM_ZEN3 = {
     "Vermeer / Chagall / Milan (Zen 3)",
-    0x29, 0x2B, 0x53, 0x54, 0x55, 0x6E,
-    "NOTE: Zen 3 inherits the Zen 2 RSMU table, so 0x29/0x2B are attempted "
-    "but UNVERIFIED on Zen 3. Failures are reported; a failed command applies nothing."
+    0x53, 0x54, 0x55, 0x6E,
+    "NOTE: HSMP on Zen 3 is UNVERIFIED (same mailbox/messages as Zen 2, "
+    "but never run there). The interface-version gate decides at runtime."
 };
 static const FamilyTable FAM_ZEN4 = {
     "Raphael / Dragon Range / Genoa / Storm Peak (Zen 4)",
-    0, 0x70, 0x56, 0x57, 0x58, 0x6E,
-    "NOTE: Zen 4 has no single-core boost-limit command in the sourced table "
-    "(only all-core 0x70); SingleCoreMaxMHz is ignored on this CPU."
+    0x56, 0x57, 0x58, 0x6E,
+    "NOTE: HSMP on Zen 4 is UNVERIFIED (same mailbox/messages as Zen 2, "
+    "but never run there). The interface-version gate decides at runtime."
 };
 
 /* Codename lookup for logging and the refuse message (Cpu.cs). NULL if unknown. */
@@ -620,6 +644,117 @@ static int smu_get_version(uint32_t *ver)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* HSMP (Host System Management Port) -- the boost-cap transport       */
+/* ------------------------------------------------------------------ */
+
+/* HSMP mailbox (Zen 2/3/4; ZenStates-Core Zen2Settings/Zen3Settings/
+ * Zen4Settings). Zen 5 uses a different MSG address and is refused. */
+#define HSMP_MSG  0x3B10534u
+#define HSMP_RSP  0x3B10980u
+#define HSMP_ARG  0x3B109E0u
+#define HSMP_MAX_ARGS 8
+
+/* HSMP messages (Linux kernel amd_hsmp.h; HSMPMailbox.cs). */
+#define HSMP_GET_IFACE_VERSION   0x3u
+#define HSMP_SET_BOOST_LIMIT     0x8u
+#define HSMP_SET_BOOST_LIMIT_ALL 0x9u
+#define HSMP_GET_BOOST_LIMIT     0xAu
+
+/* SMU status codes (SMU.cs). */
+#define SMU_OK               0x01u
+#define SMU_FAILED           0xFFu
+#define SMU_UNKNOWN_CMD      0xFEu
+#define SMU_REJECTED_PREREQ  0xFDu
+#define SMU_REJECTED_BUSY    0xFCu
+
+/* Raw SMU register access (RyzenSmu.cs: ioctl_read/write_smu_register).
+ * These read/write ANY SMU register by address -- unlike
+ * ioctl_send_smu_command, they are not tied to the RSMU mailbox. */
+static int smu_reg_read(uint32_t reg, uint32_t *val)
+{
+    int64_t in[1] = { (int64_t)reg };
+    int64_t out[1] = { 0 };
+    int rc = pawn_execute(g_smu, "ioctl_read_smu_register", in, 1, out, 1);
+    if (rc != 0) return rc;
+    *val = (uint32_t)(out[0] & 0xFFFFFFFFu);
+    return 0;
+}
+
+static int smu_reg_write(uint32_t reg, uint32_t val)
+{
+    int64_t in[2] = { (int64_t)reg, (int64_t)val };
+    return pawn_execute(g_smu, "ioctl_write_smu_register", in, 2, NULL, 0);
+}
+
+/* Wait until the HSMP response register is non-zero (previous command
+ * done). Mirrors SmuWaitDoneNoLock: 8192 iterations, 500 ms hang guard. */
+static int hsmp_wait_done(void)
+{
+    unsigned int timeout = 8192;
+    ULONGLONG deadline = GetTickCount64() + 500;
+    uint32_t data = 0;
+    for (;;) {
+        if (smu_reg_read(HSMP_RSP, &data) != 0) return 0;
+        if (data != 0) return 1;
+        if (--timeout == 0) return 0;
+        if (GetTickCount64() >= deadline) return 0;
+    }
+}
+
+/* Send one HSMP message. args_in[0..n_in) are written (padded to 8 with
+ * zero); on SMU OK, args_out[0..n_out) are read back. Returns the SMU
+ * status byte (0x01 = OK), or -1 on transport failure (PCI/timeout).
+ * The caller holds the PCI lock. */
+static int hsmp_send(uint32_t msg, const uint32_t *args_in, unsigned int n_in,
+                     uint32_t *args_out, unsigned int n_out)
+{
+    unsigned int i;
+    uint32_t status = 0;
+
+    if (!hsmp_wait_done()) return -1;
+    if (smu_reg_write(HSMP_RSP, 0) != 0) return -1;
+    for (i = 0; i < HSMP_MAX_ARGS; i++) {
+        uint32_t v = (i < n_in) ? args_in[i] : 0;
+        if (smu_reg_write(HSMP_ARG + i * 4u, v) != 0) return -1;
+    }
+    if (smu_reg_write(HSMP_MSG, msg) != 0) return -1;
+    if (!hsmp_wait_done()) return -1;
+    if (smu_reg_read(HSMP_RSP, &status) != 0) return -1;
+    if (status == SMU_OK) {
+        for (i = 0; i < n_out; i++) {
+            if (smu_reg_read(HSMP_ARG + i * 4u, &args_out[i]) != 0) return -1;
+        }
+    }
+    return (int)status;
+}
+
+static const char *smu_status_name(int st)
+{
+    switch (st) {
+    case (int)SMU_OK: return "OK";
+    case (int)SMU_FAILED: return "FAILED";
+    case (int)SMU_UNKNOWN_CMD: return "UNKNOWN_CMD";
+    case (int)SMU_REJECTED_PREREQ: return "CMD_REJECTED_PREREQ";
+    case (int)SMU_REJECTED_BUSY: return "CMD_REJECTED_BUSY";
+    case -1: return "TRANSPORT_ERROR (PCI/timeout)";
+    default: return "unknown status";
+    }
+}
+
+/* Initial APIC ID of logical core `core` (CPUID leaf 1, EBX[31:24]). */
+static int apic_id_of_core(int core)
+{
+    DWORD_PTR old = SetThreadAffinityMask(GetCurrentThread(), ((DWORD_PTR)1) << core);
+    unsigned int eax, ebx, ecx, edx;
+    int apic = -1;
+    if (old == 0) return -1;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+        apic = (int)((ebx >> 24) & 0xFFu);
+    SetThreadAffinityMask(GetCurrentThread(), old);
+    return apic;
+}
+
 /* MSR via AMDFamily17 module: ioctl_read_msr [index] -> [value],
  * ioctl_write_msr [index, value] -> []. */
 static int msr_read(uint32_t index, uint64_t *value)
@@ -703,7 +838,7 @@ static void pci_unlock(void)
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-int main(void)
+int main(int argc, char **argv)
 {
     Config cfg;
     char smu_bin[MAX_PATH], msr_bin[MAX_PATH];
@@ -711,6 +846,14 @@ int main(void)
     int failures = 0;
     const FamilyTable *fam = NULL;
     int stock_max = 0;
+    int effective_cap = 0;  /* HSMP socket cap = min(single, all) */
+    int read_mode = 0;      /* --read: read the CPU config into the INI, apply nothing */
+    {
+        int i;
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--read") == 0) read_mode = 1;
+        }
+    }
 
     get_exe_dir();
     /* Log file is opened after the INI is read in a second pass below;
@@ -784,6 +927,73 @@ int main(void)
         log_msg("stock boost limit (Fmax, 0x6E read-back) = %d MHz", stock_max);
     }
 
+    /* --read mode: read the current config from the CPU and write it into
+     * the INI, then exit without applying anything. Read-only: no SMU
+     * command here writes a setting. Runs inside the PCI lock (hsmp_send
+     * requires it), same as the apply path. */
+    if (read_mode) {
+        int apic0 = apic_id_of_core(0);
+        uint32_t outarg[1] = { 0 };
+        int st;
+        int cur_cap = 0;
+        char b[16];
+        if (apic0 < 0) {
+            log_msg("ERROR: --read: could not read APIC ID of core 0.");
+            pci_unlock();
+            if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+            if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+            if (g_log) fclose(g_log);
+            return 1;
+        }
+        st = hsmp_send(HSMP_GET_IFACE_VERSION, NULL, 0, outarg, 1);
+        log_msg("HSMP GetInterfaceVersion (0x3): status=0x%02X (%s), version=%u",
+                (unsigned)st, smu_status_name(st), outarg[0]);
+        if (st != (int)SMU_OK || outarg[0] == 0) {
+            log_msg("ERROR: --read: HSMP NOT SUPPORTED on this CPU/firmware; cannot read the cap.");
+            pci_unlock();
+            if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+            if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+            if (g_log) fclose(g_log);
+            return 1;
+        }
+        {
+            uint32_t inarg[1] = { (uint32_t)apic0 };
+            st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+            log_msg("HSMP GetBoostLimit (0xA, apic %d): status=0x%02X (%s), limit=%u MHz",
+                    apic0, (unsigned)st, smu_status_name(st), outarg[0]);
+            if (st != (int)SMU_OK || (int)outarg[0] < FREQ_FLOOR || (int)outarg[0] > FREQ_CEIL) {
+                log_msg("ERROR: --read: current cap read failed or implausible.");
+                pci_unlock();
+                if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+                if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+                if (g_log) fclose(g_log);
+                return 1;
+            }
+            cur_cap = (int)outarg[0];
+        }
+        /* Write the INI: Boost keys = the current socket cap (HSMP is
+         * single-valued, so both keys get the same value). Power keys are
+         * written as EMPTY entries -- they cannot be read back on Zen 2,
+         * and an empty value means "unset" for both the main program and
+         * the GUI. [Startup]/[Logging] are not touched. */
+        snprintf(b, sizeof(b), "%d", cur_cap);
+        WritePrivateProfileStringA("Boost", "SingleCoreMaxMHz", b, cfg.ini_path);
+        WritePrivateProfileStringA("Boost", "AllCoreMaxMHz", b, cfg.ini_path);
+        WritePrivateProfileStringA("Power", "PPT_W", "", cfg.ini_path);
+        WritePrivateProfileStringA("Power", "TDC_A", "", cfg.ini_path);
+        WritePrivateProfileStringA("Power", "EDC_A", "", cfg.ini_path);
+        log_msg("--read: wrote %s: [Boost] SingleCoreMaxMHz=%d, AllCoreMaxMHz=%d "
+                "(current HSMP socket cap); [Power] PPT_W/TDC_A/EDC_A left empty "
+                "(cannot be read back on this CPU). Stock max (fused) = %d MHz. "
+                "Nothing was applied.",
+                cfg.ini_path, cur_cap, cur_cap, stock_max);
+        pci_unlock();
+        if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+        if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+        if (g_log) fclose(g_log);
+        return 0;
+    }
+
     /* Ceiling pass: clamp the INI caps to [FREQ_FLOOR, stock_max]. */
     if (cfg.single_mhz > stock_max) {
         log_msg("WARN: SingleCoreMaxMHz=%d above stock max %d; clamping to %d",
@@ -803,17 +1013,60 @@ int main(void)
     log_msg("caps to apply: single<=%d MHz, all-core<=%d MHz (stock max %d MHz)",
             cfg.single_mhz, cfg.all_mhz, stock_max);
 
-    /* Order: all-core cap first, then single-core cap, then power limits
-     * (only the ones set in the INI). All are RSMU commands; the
-     * RyzenSMU module only supports the RSMU mailbox, which is exactly
-     * what these codes need. */
-    if (smu_send(fam->cmd_set_all, (uint32_t)cfg.all_mhz) != 0) failures++;    /* all-core boost cap */
-    if (fam->cmd_set_single != 0) {
-        if (smu_send(fam->cmd_set_single, (uint32_t)cfg.single_mhz) != 0) failures++; /* single-core boost cap */
-    } else {
-        log_msg("single-core cap skipped: no single-core boost-limit command for %s; "
-                "SingleCoreMaxMHz is ignored on this CPU", fam->name);
+    /* The boost cap: HSMP 0x9 (socket-wide). HSMP has a SINGLE socket cap,
+     * so the two INI values collapse to one effective cap:
+     * min(SingleCoreMaxMHz, AllCoreMaxMHz). The all<=single clamp above
+     * already makes that the all-core value; compute it explicitly. */
+    effective_cap = cfg.all_mhz < cfg.single_mhz ? cfg.all_mhz : cfg.single_mhz;
+    log_msg("HSMP socket cap is single-valued, so the effective cap is "
+            "min(single, all) = %d MHz", effective_cap);
+    {
+        int apic0 = apic_id_of_core(0);
+        if (apic0 < 0) {
+            log_msg("ERROR: could not read APIC ID of core 0; cannot verify the HSMP cap. Nothing was set.");
+            failures++;
+        } else {
+            uint32_t inarg[1];
+            uint32_t outarg[1] = { 0 };
+            int st;
+            /* Gate: does this SMU implement HSMP? */
+            st = hsmp_send(HSMP_GET_IFACE_VERSION, NULL, 0, outarg, 1);
+            log_msg("HSMP GetInterfaceVersion (0x3): status=0x%02X (%s), version=%u",
+                    (unsigned)st, smu_status_name(st), outarg[0]);
+            if (st != (int)SMU_OK || outarg[0] == 0) {
+                log_msg("ERROR: HSMP NOT SUPPORTED on this CPU/firmware; cannot set the cap. Nothing was applied.");
+                failures++;
+            } else {
+                /* Baseline: the HSMP limit currently set (0xA). */
+                inarg[0] = (uint32_t)apic0;
+                st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+                log_msg("HSMP GetBoostLimit (0xA, apic %d): status=0x%02X (%s), limit=%u MHz",
+                        apic0, (unsigned)st, smu_status_name(st), outarg[0]);
+                /* Set the socket cap. */
+                inarg[0] = (uint32_t)effective_cap;
+                st = hsmp_send(HSMP_SET_BOOST_LIMIT_ALL, inarg, 1, NULL, 0);
+                log_msg("HSMP SetBoostLimitSocket (0x9, arg %d MHz): status=0x%02X (%s)",
+                        effective_cap, (unsigned)st, smu_status_name(st));
+                if (st != (int)SMU_OK) {
+                    log_msg("ERROR: HSMP set failed; the cap was NOT applied.");
+                    failures++;
+                } else {
+                    /* Verify via 0xA. */
+                    inarg[0] = (uint32_t)apic0;
+                    st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+                    log_msg("HSMP GetBoostLimit read-back (0xA): status=0x%02X (%s), limit=%u MHz%s",
+                            (unsigned)st, smu_status_name(st), outarg[0],
+                            (st == (int)SMU_OK && (int)outarg[0] == effective_cap) ? " (SET TOOK EFFECT)" : " (SET DID NOT TAKE EFFECT)");
+                    if (st != (int)SMU_OK || (int)outarg[0] != effective_cap) {
+                        log_msg("ERROR: HSMP read-back does not match the target; the cap was NOT applied.");
+                        failures++;
+                    }
+                }
+            }
+        }
     }
+
+    /* Power limits (only the ones set in the INI). Still RSMU DPTC. */
     if (cfg.ppt_set) {
         if (smu_send(fam->cmd_ppt, (uint32_t)cfg.ppt_w * 1000u) != 0) failures++; /* PPT, mW */
     } else {
@@ -830,35 +1083,29 @@ int main(void)
         log_msg("EDC left untouched (EDC_A not set in the INI)");
     }
 
-    /* Verification read-back (best effort, do not fail the run on it):
-     * 0x6E GetBoostLimitFrequency. Unconfirmed whether it returns the
-     * single-core or the all-core limit, so log it, don't judge. */
+    /* Final reference read (best effort, do not fail the run on it):
+     * RSMU 0x6E GetBoostLimitFrequency reads the FUSED stock max, which
+     * the HSMP socket cap does NOT change -- so expect the stock max here,
+     * not the cap. The cap itself was already verified via HSMP 0xA above. */
     {
         int64_t in[7] = { (int64_t)fam->cmd_get_limit, 0, 0, 0, 0, 0, 0 };
         int64_t out[6] = { 0 };
         int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
         if (rc == 0)
-            log_msg("verify: GetBoostLimitFrequency (0x6E) returned %lld MHz "
-                    "(expect ~%d; which limit this reports is unconfirmed)",
-                    (long long)out[0], cfg.all_mhz);
+            log_msg("reference: GetBoostLimitFrequency (0x6E) returned %lld MHz "
+                    "(fused stock max; the HSMP cap does not change it)",
+                    (long long)out[0]);
         else
-            log_msg("WARN: verify read-back 0x6E failed (win32=%d); check HWMonitor instead", rc);
+            log_msg("WARN: reference read-back 0x6E failed (win32=%d); check HWMonitor instead", rc);
     }
     pci_unlock();
 
     if (failures == 0) {
-        if (fam->cmd_set_single != 0) {
-            log_msg("OK: boost cap applied on %s: single<=%d MHz, all-core<=%d MHz. "
-                    "Boost stays dynamic below the cap; verify in HWMonitor "
-                    "(max core clock should stop at ~%d MHz).",
-                    fam->name, cfg.single_mhz, cfg.all_mhz, cfg.single_mhz);
-        } else {
-            log_msg("OK: all-core boost cap applied on %s: all-core<=%d MHz "
-                    "(no single-core cap command exists for this family). "
-                    "Boost stays dynamic below the cap; verify in HWMonitor "
-                    "(max core clock should stop at ~%d MHz).",
-                    fam->name, cfg.all_mhz, cfg.all_mhz);
-        }
+        log_msg("OK: HSMP socket boost cap applied on %s: effective cap %d MHz "
+                "(min of single<=%d and all-core<=%d; HSMP is single-valued). "
+                "Boost stays dynamic below the cap; verify in HWMonitor "
+                "(max core clock should stop at ~%d MHz).",
+                fam->name, effective_cap, cfg.single_mhz, cfg.all_mhz, effective_cap);
     } else {
         log_msg("DONE WITH %d FAILED SMU COMMAND(S) (see above). "
                 "The CPU was left in whatever state the successful commands set; "

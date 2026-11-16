@@ -36,3 +36,6 @@ Desktop.ini
 # Local notes that are not part of the release
 *.tmp
 *.bak
+
+# Local design notes, not for upload (co-edited during design)
+EFI-DESIGN.md

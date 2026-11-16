@@ -2,7 +2,9 @@
 # build.sh -- cross-compile the Windows binaries on Linux (verification build).
 # Needs: x86_64-w64-mingw32-gcc and windres (package mingw-w64 on Debian/Ubuntu).
 #   ./build.sh
-# Output: zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe in this folder.
+# Output: zenstates-c.exe, zenstates-c-gui.exe, zenstates-c-gui-xl.exe
+# (the 2x-layout GUI, built from the same source with -DGUI_SCALE=2),
+# zenstates-vf.exe, zenstates-hsmp.exe in this folder.
 set -e
 cd "$(dirname "$0")"
 CC=${CC:-x86_64-w64-mingw32-gcc}
@@ -24,9 +26,13 @@ if [ -z "$WINDRES" ]; then
 fi
 "$WINDRES" zenstates-c.rc -O coff -o zenstates-c-res.o
 "$WINDRES" zenstates-c-gui.rc -O coff -o zenstates-c-gui-res.o
+"$WINDRES" zenstates-c-gui-xl.rc -O coff -o zenstates-c-gui-xl-res.o
 "$WINDRES" zenstates-vf.rc -O coff -o zenstates-vf-res.o
+"$WINDRES" zenstates-hsmp.rc -O coff -o zenstates-hsmp-res.o
 "$CC" -O2 -Wall -Wextra -o zenstates-c.exe zenstates-c.c zenstates-c-res.o
 "$CC" -O2 -Wall -Wextra -mwindows -o zenstates-c-gui.exe zenstates-c-gui.c zenstates-c-gui-res.o -lcomctl32
+"$CC" -O2 -Wall -Wextra -mwindows -DGUI_SCALE=2 -o zenstates-c-gui-xl.exe zenstates-c-gui.c zenstates-c-gui-xl-res.o -lcomctl32
 "$CC" -O2 -Wall -Wextra -o zenstates-vf.exe zenstates-vf.c zenstates-vf-res.o
-ls -l zenstates-c.exe zenstates-c-gui.exe zenstates-vf.exe
-file zenstates-c.exe zenstates-c-gui.exe zenstates-vf.exe
+"$CC" -O2 -Wall -Wextra -o zenstates-hsmp.exe zenstates-hsmp.c zenstates-hsmp-res.o
+ls -l zenstates-c.exe zenstates-c-gui.exe zenstates-c-gui-xl.exe zenstates-vf.exe zenstates-hsmp.exe
+file zenstates-c.exe zenstates-c-gui.exe zenstates-c-gui-xl.exe zenstates-vf.exe zenstates-hsmp.exe

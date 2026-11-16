@@ -1,5 +1,16 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
- * zenstates-vf.c -- empirical V/F sweep for Ryzen desktop CPUs (Zen 2 / Zen 3), 0.2.0.
+ * zenstates-vf.c -- empirical V/F sweep for Ryzen desktop CPUs (Zen 2 / Zen 3 / Zen 4), 0.2.2.
+ *
+ * Modes:
+ *   (no args)  Sweep (see below).
+ *   --hold [core]  Hold a load: pin a scalar spin-load to one core and
+ *              print its frequency and voltage every second until Ctrl+C.
+ *              Does NOT set any cap -- it holds a load against whatever cap
+ *              is currently installed (set it first with zenstates-c.exe or
+ *              zenstates-hsmp.exe), so you can watch HWMonitor and confirm
+ *              the cap holds under sustained load. The sweep already spins
+ *              the same load thread while it runs; --hold is the standalone
+ *              version for when you just want to hold a core at load.
  *
  * What it measures (and what it does NOT):
  *   There is NO SMU command that dumps the fused V/F table: ZenStates-Core
@@ -7,25 +18,37 @@
  *   PowerTable telemetry (live frequency / voltage / power), not a curve.
  *   The V/F curve lives inside SMU firmware as fused FIT data.
  *   So this tool measures the curve instead of reading it: for each target
- *   frequency it caps Boost to that frequency (the same cap messages
- *   zenstates-c.c uses), pins a scalar spin-load to one core so that core
- *   actually boosts to the cap, and reads the VID that SMU requests at that
- *   point. One CSV row per sample; the median per target is the V/F point.
+ *   frequency it caps Boost to that frequency (the HSMP socket cap, the
+ *   same cap zenstates-c.c uses), pins a scalar spin-load to one core so
+ *   that core actually boosts to the cap, and reads the VID that SMU
+ *   requests at that point. One CSV row per sample; the median per target
+ *   is the V/F point.
  *
- * Scope: Matisse / Castle Peak and Vermeer / Chagall / Milan only -- the
- *   sweep needs BOTH the single-core and the all-core cap, and Zen 4 has
- *   no single-core cap command in the sourced table, so Zen 4 is refused
- *   (the all-core cap alone cannot constrain a single-core load). Zen 1 /
- *   Zen+ / Rome / APUs / Zen 5 have no cap command at all and are refused
- *   too. See zenstates-c.c for the family table and sources.
+ * Scope: Matisse / Castle Peak, Vermeer / Chagall / Milan, and Raphael /
+ *   Dragon Range / Genoa / Storm Peak. 0.2.1 moved the cap to HSMP
+ *   (0x9 socket-wide), which is a single cap that constrains any loaded
+ *   core -- so Zen 4 is now sweepable too (it was refused before because
+ *   the old RSMU route had no single-core cap for it). Zen 1 / Zen+ /
+ *   Rome / APUs / Zen 5 have no HSMP mailbox in the sourced table and are
+ *   refused. Zen 3 and Zen 4 via HSMP are UNVERIFIED (same mailbox and
+ *   messages as Zen 2, but never run there); the interface-version gate
+ *   decides at runtime. See zenstates-c.c for the family table and sources.
  *
  * Fmax (no hardcoded 4200 any more): at startup the tool reads 0x6E
  *   GetBoostLimitFrequency -- the same call upstream's Cpu.GetFMax() uses.
- *   That value is the sweep's start (unless the INI sets StartMHz) and the
- *   restore value at the end. The sweep is therefore non-destructive: if a
- *   cap was already installed (e.g. by zenstates-c's autostart), the sweep
- *   restores exactly that cap at the end. If the read fails or returns an
- *   implausible value the tool aborts before sending any cap.
+ *   0x6E reads the FUSED stock max, which the HSMP socket cap does NOT
+ *   change, so it stays the correct ceiling (and the sweep's start,
+ *   unless the INI sets StartMHz) even when a cap is already installed.
+ *   The RESTORE value is different: it is the HSMP limit (0xA) read
+ *   before the sweep, i.e. the cap that was active when the tool started
+ *   (e.g. zenstates-c's autostart cap) -- the sweep restores exactly
+ *   that cap at the end and is therefore non-destructive. EndMHz 0 means
+ *   Fmax - 600. If the 0x6E read fails or returns an implausible value
+ *   the tool aborts before sending any cap. After every cap set the tool
+ *   reads HSMP 0xA back and logs whether the new limit actually took
+ *   effect -- a rejected command and a silently-ignored one look
+ *   different in that read-back. (0x6E is NOT used for the per-target
+ *   read-back: it reads the fused max, not the HSMP cap.)
  *
  * Read path (all from ZenStates-Core source, same as the main program):
  *   MSR 0xC0010293 HW_PSTATE_STATUS, read on the measured core via PawnIO
@@ -35,16 +58,21 @@
  *     multiplier = 2.0 * Fid / DfsId            (Cpu.GetCoreMulti)
  *     frequency  = multiplier * 100 MHz          (Cpu.GetCoreClockMhz, BCLK=100)
  *     voltage    = 1.55 - Vid * 0.00625 V        (Utils.VidToVoltage, SVI2)
- *   The spin-load runs on logical core LoadCore, the reader pins itself to
- *   the SMT sibling (LoadCore^1) of the same physical core, so both observe
- *   the same core clock / VID. The load is a plain scalar integer loop
- *   (no AVX): the curve measured is the scalar-boost curve.
+ *   The spin-load runs on logical core LoadCore; the reader pins itself to
+ *   the load core's true SMT sibling (found via the APIC ID, not assumed
+ *   to be LoadCore^1 -- logical-processor numbering need not interleave
+ *   siblings), so both observe the same core clock / VID. If no sibling
+ *   exists (SMT off) the reader measures the load core itself. Both the
+ *   reader core and the load core are sampled, so a wrong-core reading
+ *   shows up as a mismatch instead of a silent bad curve. The load is a
+ *   plain scalar integer loop (no AVX): the curve measured is the
+ *   scalar-boost curve.
  *
- * What it writes: ONLY the two Boost-limit SMU commands (per the family
- *   table in zenstates-c.c) and, at the end, a restore of both caps to the
- *   value 0x6E reported before the sweep (the pre-sweep limit, not a
- *   constant). It never writes an MSR, never sets a fixed frequency,
- *   never sets a fixed voltage or VID. A reboot also restores stock.
+ * What it writes: ONLY the HSMP socket-cap message (0x9) per target and,
+ *   at the end, a restore of the socket cap to the HSMP limit (0xA)
+ *   reported before the sweep (the pre-sweep limit, not a constant). It
+ *   never writes an MSR, never sets a fixed frequency, never sets a fixed
+ *   voltage or VID. A reboot also restores stock.
  *
  * Plumbing (PawnIO device, module loading, SMU send, MSR read, HWCR fix,
  * PCI lock, admin + CPU checks) is copied from zenstates-c.c in this
@@ -72,9 +100,11 @@
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
 
-/* StartMHz 0 (or absent) = start at the Fmax read back from the SMU. */
+/* StartMHz 0 (or absent) = start at the Fmax read back from the SMU.
+ * EndMHz 0 (or absent) = end at Fmax - 600 MHz (resolved in main after
+ * the Fmax read-back); an explicit value pins the floor instead. */
 #define DEFAULT_START_MHZ   0
-#define DEFAULT_END_MHZ     3600
+#define DEFAULT_END_MHZ     0
 #define DEFAULT_STEP_MHZ    100
 #define DEFAULT_SETTLE_MS   1500
 #define DEFAULT_SAMPLES     5
@@ -213,7 +243,8 @@ static void load_config(Config *c)
      * the SMU read-back. StartMHz 0 means "start at Fmax" (resolved there). */
     if (c->start_mhz != 0)
         c->start_mhz = clamp_int(c->start_mhz, FREQ_FLOOR, FREQ_CEIL, "StartMHz");
-    c->end_mhz   = clamp_int(c->end_mhz, FREQ_FLOOR, FREQ_CEIL, "EndMHz");
+    if (c->end_mhz != 0)
+        c->end_mhz = clamp_int(c->end_mhz, FREQ_FLOOR, FREQ_CEIL, "EndMHz");
     c->step_mhz  = clamp_int(c->step_mhz, 25, 200, "StepMHz");
     c->settle_ms = clamp_int(c->settle_ms, 500, 10000, "SettleMs");
     c->samples   = clamp_int(c->samples, 1, 20, "Samples");
@@ -251,28 +282,32 @@ static bool is_admin(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* CPU detection + per-family SMU table (0.2.0, copied from            */
-/* zenstates-c.c; the sweep needs BOTH cap commands, so Zen 4 -- which */
-/* has only the all-core one -- is refused here, not just noted)       */
+/* CPU detection + per-family SMU table (0.2.1, copied from            */
+/* zenstates-c.c; the cap is HSMP 0x9 for every supported family, so   */
+/* Zen 4 is sweepable now -- the socket cap constrains any loaded core)*/
 /* ------------------------------------------------------------------ */
 
 typedef struct {
     const char *name;
-    uint32_t cmd_set_single;
-    uint32_t cmd_set_all;
-    uint32_t cmd_get_limit;
+    uint32_t cmd_get_limit;  /* 0x6E: fused stock max (ceiling) */
     const char *note;
 } FamilyTable;
 
 static const FamilyTable FAM_MATISSE = {
     "Matisse / Castle Peak (Zen 2)",
-    0x29, 0x2B, 0x6E, NULL
+    0x6E, NULL
 };
 static const FamilyTable FAM_ZEN3 = {
     "Vermeer / Chagall / Milan (Zen 3)",
-    0x29, 0x2B, 0x6E,
-    "NOTE: Zen 3 inherits the Zen 2 RSMU table, so 0x29/0x2B are attempted "
-    "but UNVERIFIED on Zen 3. Failures are reported; a failed command applies nothing."
+    0x6E,
+    "NOTE: HSMP on Zen 3 is UNVERIFIED (same mailbox/messages as Zen 2, "
+    "but never run there). The interface-version gate decides at runtime."
+};
+static const FamilyTable FAM_ZEN4 = {
+    "Raphael / Dragon Range / Genoa / Storm Peak (Zen 4)",
+    0x6E,
+    "NOTE: HSMP on Zen 4 is UNVERIFIED (same mailbox/messages as Zen 2, "
+    "but never run there). The interface-version gate decides at runtime."
 };
 
 /* Codename lookup for logging and the refuse message (Cpu.cs). NULL if unknown. */
@@ -360,15 +395,9 @@ static const FamilyTable *detect_cpu(void)
         case 0x21: case 0x08: case 0x01:
             return &FAM_ZEN3;
         case 0x61: case 0x11: case 0x18:
-            /* The sweep needs a single-core cap to constrain the one loaded
-             * core; Zen 4 only has the all-core code (0x70), which cannot
-             * constrain a single-core load. Refusing is the honest answer. */
-            log_msg("ERROR: refusing to run: %s has no single-core boost-limit "
-                    "command in the sourced table (only all-core 0x70), and the "
-                    "sweep needs one to constrain its single-core load. The main "
-                    "program (zenstates-c.exe) does support Zen 4, all-core only.",
-                    name ? name : "this CPU (Zen 4)");
-            return NULL;
+            /* HSMP 0x9 is a single socket-wide cap, so it constrains the
+             * one loaded core exactly like it does on Zen 2/3. */
+            return &FAM_ZEN4;
         default:
             log_msg("ERROR: refusing to run: %s has no boost-limit command in "
                     "the sourced ZenStates table, so there is no safe cap to send.",
@@ -377,7 +406,7 @@ static const FamilyTable *detect_cpu(void)
         }
     }
     log_msg("ERROR: refusing to run: family 0x%X is not a supported Zen generation "
-            "(Zen 2 / Zen 3 desktop).", family);
+            "(Zen 2 / Zen 3 / Zen 4 desktop).", family);
     return NULL;
 }
 
@@ -496,25 +525,115 @@ static bool find_module(const char *name, char *out, size_t out_size)
     return false;
 }
 
-static int smu_send(uint32_t cmd, uint32_t arg0)
-{
-    int64_t in[7] = { (int64_t)cmd, (int64_t)arg0, 0, 0, 0, 0, 0 };
-    int64_t out[6] = { 0 };
-    int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
-    if (rc != 0) {
-        log_msg("ERROR: SMU cmd 0x%02X arg %u failed, win32=%d (0x%X)",
-                cmd, arg0, rc, rc);
-        return rc;
-    }
-    return 0;
-}
-
 static int smu_get_version(uint32_t *ver)
 {
     int64_t out[1] = { 0 };
     int rc = pawn_execute(g_smu, "ioctl_get_smu_version", NULL, 0, out, 1);
     if (rc != 0) return rc;
     *ver = (uint32_t)(out[0] & 0xFFFFFFFFu);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* HSMP (Host System Management Port) -- the boost-cap transport       */
+/* (same as zenstates-c.c / zenstates-hsmp.c)                          */
+/* ------------------------------------------------------------------ */
+
+#define HSMP_MSG  0x3B10534u
+#define HSMP_RSP  0x3B10980u
+#define HSMP_ARG  0x3B109E0u
+#define HSMP_MAX_ARGS 8
+
+#define HSMP_GET_IFACE_VERSION   0x3u
+#define HSMP_SET_BOOST_LIMIT     0x8u
+#define HSMP_SET_BOOST_LIMIT_ALL 0x9u
+#define HSMP_GET_BOOST_LIMIT     0xAu
+
+#define SMU_OK               0x01u
+#define SMU_FAILED           0xFFu
+#define SMU_UNKNOWN_CMD      0xFEu
+#define SMU_REJECTED_PREREQ  0xFDu
+#define SMU_REJECTED_BUSY    0xFCu
+
+/* Raw SMU register access (RyzenSmu.cs: ioctl_read/write_smu_register). */
+static int smu_reg_read(uint32_t reg, uint32_t *val)
+{
+    int64_t in[1] = { (int64_t)reg };
+    int64_t out[1] = { 0 };
+    int rc = pawn_execute(g_smu, "ioctl_read_smu_register", in, 1, out, 1);
+    if (rc != 0) return rc;
+    *val = (uint32_t)(out[0] & 0xFFFFFFFFu);
+    return 0;
+}
+
+static int smu_reg_write(uint32_t reg, uint32_t val)
+{
+    int64_t in[2] = { (int64_t)reg, (int64_t)val };
+    return pawn_execute(g_smu, "ioctl_write_smu_register", in, 2, NULL, 0);
+}
+
+static int hsmp_wait_done(void)
+{
+    unsigned int timeout = 8192;
+    ULONGLONG deadline = GetTickCount64() + 500;
+    uint32_t data = 0;
+    for (;;) {
+        if (smu_reg_read(HSMP_RSP, &data) != 0) return 0;
+        if (data != 0) return 1;
+        if (--timeout == 0) return 0;
+        if (GetTickCount64() >= deadline) return 0;
+    }
+}
+
+/* Send one HSMP message. Returns the SMU status byte (0x01 = OK), or -1
+ * on transport failure. The caller holds the PCI lock. */
+static int hsmp_send(uint32_t msg, const uint32_t *args_in, unsigned int n_in,
+                     uint32_t *args_out, unsigned int n_out)
+{
+    unsigned int i;
+    uint32_t status = 0;
+
+    if (!hsmp_wait_done()) return -1;
+    if (smu_reg_write(HSMP_RSP, 0) != 0) return -1;
+    for (i = 0; i < HSMP_MAX_ARGS; i++) {
+        uint32_t v = (i < n_in) ? args_in[i] : 0;
+        if (smu_reg_write(HSMP_ARG + i * 4u, v) != 0) return -1;
+    }
+    if (smu_reg_write(HSMP_MSG, msg) != 0) return -1;
+    if (!hsmp_wait_done()) return -1;
+    if (smu_reg_read(HSMP_RSP, &status) != 0) return -1;
+    if (status == SMU_OK) {
+        for (i = 0; i < n_out; i++) {
+            if (smu_reg_read(HSMP_ARG + i * 4u, &args_out[i]) != 0) return -1;
+        }
+    }
+    return (int)status;
+}
+
+static const char *smu_status_name(int st)
+{
+    switch (st) {
+    case (int)SMU_OK: return "OK";
+    case (int)SMU_FAILED: return "FAILED";
+    case (int)SMU_UNKNOWN_CMD: return "UNKNOWN_CMD";
+    case (int)SMU_REJECTED_PREREQ: return "CMD_REJECTED_PREREQ";
+    case (int)SMU_REJECTED_BUSY: return "CMD_REJECTED_BUSY";
+    case -1: return "TRANSPORT_ERROR (PCI/timeout)";
+    default: return "unknown status";
+    }
+}
+
+/* Read the current boost limit via cmd_get_limit (0x6E). Returns the
+ * Win32 error from the send (0 on success); *mhz is set only on success.
+ * Used for the startup Fmax read, the read-back after every cap set, and
+ * the read-back after restore. */
+static int smu_get_limit(uint32_t cmd, int *mhz)
+{
+    int64_t in[7] = { (int64_t)cmd, 0, 0, 0, 0, 0, 0 };
+    int64_t out[6] = { 0 };
+    int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
+    if (rc != 0) return rc;
+    *mhz = (int)out[0];
     return 0;
 }
 
@@ -623,6 +742,44 @@ static int read_pstate_on_core(int core, PState *ps)
     return 0;
 }
 
+/* Initial APIC ID of logical core `core` (CPUID leaf 1, EBX[31:24]).
+ * The calling thread is pinned there for the read. Returns -1 on failure. */
+static int apic_id_of_core(int core)
+{
+    DWORD_PTR old = SetThreadAffinityMask(GetCurrentThread(), ((DWORD_PTR)1) << core);
+    unsigned int eax, ebx, ecx, edx;
+    int apic = -1;
+    if (old == 0) return -1;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+        apic = (int)((ebx >> 24) & 0xFFu);
+    SetThreadAffinityMask(GetCurrentThread(), old);
+    return apic;
+}
+
+/* The true SMT sibling of logical core `load_core`: the logical processor
+ * whose APIC ID differs from the load core's only in bit 0 (2-way SMT).
+ * Returns -1 when there is none (SMT off) or the topology cannot be read.
+ * Do NOT assume sibling == load_core ^ 1: logical-processor numbering is
+ * not guaranteed to interleave siblings. */
+static int find_smt_sibling(int load_core)
+{
+    SYSTEM_INFO si;
+    DWORD n, i;
+    int base;
+    GetSystemInfo(&si);
+    n = si.dwNumberOfProcessors;
+    if (n == 0 || n > 64) n = 64;
+    base = apic_id_of_core(load_core);
+    if (base < 0) return -1;
+    for (i = 0; i < n; i++) {
+        int a;
+        if ((int)i == load_core) continue;
+        a = apic_id_of_core((int)i);
+        if (a >= 0 && (a ^ base) == 1) return (int)i;
+    }
+    return -1;
+}
+
 static volatile LONG g_load_stop = 0;
 static volatile unsigned long long g_load_counter = 0;
 
@@ -638,6 +795,82 @@ static DWORD WINAPI load_thread(LPVOID param)
         x ^= x >> 29;
         g_load_counter = x;
     }
+    return 0;
+}
+
+static BOOL WINAPI hold_ctrl_handler(DWORD type)
+{
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        InterlockedExchange(&g_load_stop, 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* --hold mode: pin a scalar spin-load to one core and print its frequency
+ * and voltage every second until Ctrl+C. Does NOT set any cap -- it holds a
+ * load against whatever cap is currently installed, so you can watch
+ * HWMonitor and confirm the cap holds under sustained load. Returns 0 on
+ * a clean stop (Ctrl+C), 1 on setup failure. */
+static int run_hold(int core)
+{
+    HANDLE hload;
+    int reader;
+    int nproc = 0;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    nproc = (int)si.dwNumberOfProcessors;
+    if (core < 0 || core >= nproc) {
+        log_msg("ERROR: --hold: core %d out of range (0..%d).", core, nproc - 1);
+        return 1;
+    }
+    /* Best-effort: report the HSMP cap currently installed (informational
+     * only -- the hold works even if this read fails). */
+    pci_lock();
+    {
+        uint32_t outarg[1] = { 0 };
+        int st = hsmp_send(HSMP_GET_IFACE_VERSION, NULL, 0, outarg, 1);
+        if (st == (int)SMU_OK && outarg[0] != 0) {
+            int apic = apic_id_of_core(core);
+            uint32_t inarg[1] = { (uint32_t)(apic < 0 ? 0 : apic) };
+            st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+            if (st == (int)SMU_OK)
+                log_msg("--hold: current HSMP socket cap = %u MHz", outarg[0]);
+            else
+                log_msg("--hold: HSMP cap read failed (status=0x%02X, %s).",
+                        (unsigned)st, smu_status_name(st));
+        } else {
+            log_msg("--hold: HSMP not available; cap unknown.");
+        }
+    }
+    pci_unlock();
+    reader = find_smt_sibling(core);
+    if (reader < 0) reader = core;
+    log_msg("--hold: spinning a scalar load on logical core %d (reader on core %d). "
+            "Press Ctrl+C to stop.", core, reader);
+    g_load_stop = 0;
+    hload = CreateThread(NULL, 0, load_thread, (LPVOID)(intptr_t)core, 0, NULL);
+    if (!hload) {
+        log_msg("ERROR: cannot start load thread (GetLastError=%lu)", (unsigned long)GetLastError());
+        return 1;
+    }
+    SetConsoleCtrlHandler(hold_ctrl_handler, TRUE);
+    for (;;) {
+        PState ps;
+        if (InterlockedCompareExchange(&g_load_stop, 0, 0) != 0) break;
+        if (read_pstate_on_core(reader, &ps) == 0) {
+            log_msg("hold: core %d %.0f MHz @ %.3f V (Fid=%u DfsId=%u Vid=%u)",
+                    core, ps.freq_mhz, ps.volt_v, ps.fid, ps.dfsid, ps.vid);
+        } else {
+            log_msg("hold: MSR read failed on core %d", reader);
+        }
+        Sleep(1000);
+    }
+    InterlockedExchange(&g_load_stop, 1);
+    WaitForSingleObject(hload, 5000);
+    CloseHandle(hload);
+    SetConsoleCtrlHandler(hold_ctrl_handler, FALSE);
+    log_msg("--hold: stopped.");
     return 0;
 }
 
@@ -658,7 +891,7 @@ static double median_of(double *vals, int n)
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-int main(void)
+int main(int argc, char **argv)
 {
     Config cfg;
     char smu_bin[MAX_PATH], msr_bin[MAX_PATH];
@@ -669,6 +902,22 @@ int main(void)
     const FamilyTable *fam = NULL;
     int stock_max = 0;
     int restore_mhz = 0;
+    int reader_core = 0;
+    int apic_load = -1;  /* APIC ID of the load core, for HSMP 0xA read-back */
+    int hold_mode = 0;   /* --hold: hold a load on one core until Ctrl+C */
+    int hold_core = -1;  /* core for --hold; -1 = use the INI LoadCore */
+    {
+        int i;
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--hold") == 0) {
+                hold_mode = 1;
+                if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                    hold_core = atoi(argv[i + 1]);
+                    i++;
+                }
+            }
+        }
+    }
 
     get_exe_dir();
     load_config(&cfg);
@@ -717,29 +966,84 @@ int main(void)
 
     hwcr_fix();
 
-    /* Baseline: the 0x6E read-back BEFORE the sweep. This is the stock
-     * boost limit (Fmax) -- the sweep's start (unless the INI sets
-     * StartMHz) and the restore value at the end. Abort before sending
-     * anything if the read fails or is implausible. */
+    /* --hold mode: hold a load on one core until Ctrl+C. Branches here,
+     * before the sweep baseline -- it needs no cap set, no restore, and
+     * no sweep config. */
+    if (hold_mode) {
+        int rc = run_hold(hold_core < 0 ? cfg.load_core : hold_core);
+        if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+        if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+        if (g_log) fclose(g_log);
+        return rc;
+    }
+
+    /* Baseline, two reads that mean different things:
+     *   - RSMU 0x6E: the FUSED stock max (Fmax). The ceiling for the sweep
+     *     range (and StartMHz). Unaffected by any HSMP cap already set.
+     *   - HSMP 0xA: the socket cap CURRENTLY set. The RESTORE value at the
+     *     end (so a cap installed before the sweep, e.g. by zenstates-c's
+     *     autostart, is put back exactly). Abort before sending anything
+     *     if either read fails or is implausible, or if HSMP is not
+     *     implemented on this CPU. */
     pci_lock();
     {
-        int64_t in[7] = { (int64_t)fam->cmd_get_limit, 0, 0, 0, 0, 0, 0 };
-        int64_t out[6] = { 0 };
-        int rc = pawn_execute(g_smu, "ioctl_send_smu_command", in, 7, out, 6);
-        if (rc != 0 || out[0] < FREQ_FLOOR || out[0] > FREQ_CEIL) {
+        int limit = 0;
+        int rc = smu_get_limit(fam->cmd_get_limit, &limit);
+        if (rc != 0 || limit < FREQ_FLOOR || limit > FREQ_CEIL) {
             log_msg("ERROR: stock boost limit read-back (0x%02X) failed or implausible "
-                    "(win32=%d, value=%lld MHz). Aborting before sending any cap.",
-                    fam->cmd_get_limit, rc, (long long)out[0]);
+                    "(win32=%d, value=%d MHz). Aborting before sending any cap.",
+                    fam->cmd_get_limit, rc, limit);
             pci_unlock();
             if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
             if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
             if (g_log) fclose(g_log);
             return 1;
         }
-        stock_max = (int)out[0];
-        restore_mhz = stock_max;
-        log_msg("stock boost limit (Fmax, 0x6E read-back) = %d MHz; "
-                "caps will be restored to this value at the end", stock_max);
+        stock_max = limit;
+        log_msg("stock boost limit (Fmax, 0x6E read-back) = %d MHz", stock_max);
+        {
+            uint32_t outarg[1] = { 0 };
+            int st = hsmp_send(HSMP_GET_IFACE_VERSION, NULL, 0, outarg, 1);
+            log_msg("HSMP GetInterfaceVersion (0x3): status=0x%02X (%s), version=%u",
+                    (unsigned)st, smu_status_name(st), outarg[0]);
+            if (st != (int)SMU_OK || outarg[0] == 0) {
+                log_msg("ERROR: HSMP NOT SUPPORTED on this CPU/firmware; cannot set the cap. Aborting.");
+                pci_unlock();
+                if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+                if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+                if (g_log) fclose(g_log);
+                return 1;
+            }
+        }
+        {
+            int apic = apic_id_of_core(cfg.load_core);
+            uint32_t inarg[1];
+            uint32_t outarg[1] = { 0 };
+            int st;
+            if (apic < 0) {
+                log_msg("ERROR: could not read APIC ID of load core %d; aborting.", cfg.load_core);
+                pci_unlock();
+                if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+                if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+                if (g_log) fclose(g_log);
+                return 1;
+            }
+            inarg[0] = (uint32_t)apic;
+            st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+            if (st != (int)SMU_OK || (int)outarg[0] < FREQ_FLOOR || (int)outarg[0] > FREQ_CEIL) {
+                log_msg("ERROR: pre-sweep HSMP limit read-back (0xA) failed or implausible "
+                        "(status=0x%02X, value=%u MHz). Aborting before sending any cap.",
+                        (unsigned)st, outarg[0]);
+                pci_unlock();
+                if (g_smu != INVALID_HANDLE_VALUE) CloseHandle(g_smu);
+                if (g_msr != INVALID_HANDLE_VALUE) CloseHandle(g_msr);
+                if (g_log) fclose(g_log);
+                return 1;
+            }
+            restore_mhz = (int)outarg[0];
+            log_msg("pre-sweep HSMP socket cap (0xA read-back) = %d MHz; "
+                    "it will be restored at the end", restore_mhz);
+        }
     }
     pci_unlock();
 
@@ -752,6 +1056,11 @@ int main(void)
                 cfg.start_mhz, stock_max, stock_max);
         cfg.start_mhz = stock_max;
     }
+    if (cfg.end_mhz == 0) {
+        cfg.end_mhz = stock_max - 600;
+        if (cfg.end_mhz < FREQ_FLOOR) cfg.end_mhz = FREQ_FLOOR;
+        log_msg("sweep end: EndMHz not set, using Fmax-600 = %d MHz", cfg.end_mhz);
+    }
     if (cfg.end_mhz > stock_max) {
         log_msg("WARN: EndMHz=%d above stock max %d; clamping to %d",
                 cfg.end_mhz, stock_max, stock_max);
@@ -759,13 +1068,35 @@ int main(void)
     }
     log_msg("sweep: start=%d end=%d step=%d", cfg.start_mhz, cfg.end_mhz, cfg.step_mhz);
 
+    /* Reader core: the true SMT sibling of the load core (APIC ID), not
+     * the assumed LoadCore^1. Falls back to the load core itself. */
+    reader_core = find_smt_sibling(cfg.load_core);
+    if (reader_core >= 0) {
+        log_msg("reader core: %d (SMT sibling of load core %d, via APIC ID)",
+                reader_core, cfg.load_core);
+    } else {
+        reader_core = cfg.load_core;
+        log_msg("reader core: %d (no SMT sibling found; reading the load core itself)",
+                reader_core);
+    }
+
+    /* APIC ID of the load core, for the HSMP 0xA read-back after every cap
+     * set (the socket cap is the same for every core, so any APIC ID
+     * would do; the baseline already proved this one reads). */
+    apic_load = apic_id_of_core(cfg.load_core);
+    if (apic_load < 0) {
+        log_msg("ERROR: could not read APIC ID of load core %d; aborting.", cfg.load_core);
+        if (g_log) fclose(g_log);
+        return 1;
+    }
+
     g_csv = fopen(cfg.csv_path, "w");
     if (!g_csv) {
         log_msg("ERROR: cannot open CSV output %s", cfg.csv_path);
         if (g_log) fclose(g_log);
         return 1;
     }
-    fprintf(g_csv, "TargetMHz,Sample,Fid,DfsId,Vid,FreqMHz,VoltV\n");
+    fprintf(g_csv, "TargetMHz,Sample,Fid,DfsId,Vid,FreqMHz,VoltV,LoadFreqMHz,LoadVoltV\n");
     fflush(g_csv);
 
     /* Spin the load for the whole sweep so the measured core stays boosted. */
@@ -777,22 +1108,41 @@ int main(void)
         if (g_log) fclose(g_log);
         return 1;
     }
-    log_msg("load thread spinning on logical core %d (reader uses sibling core %d)",
-            cfg.load_core, cfg.load_core ^ 1);
+    log_msg("load thread spinning on logical core %d (reader on core %d)",
+            cfg.load_core, reader_core);
 
     dir = (cfg.end_mhz >= cfg.start_mhz) ? 1 : -1;
     {
         int target = cfg.start_mhz;
         for (;;) {
-            double freqs[20], volts[20];
-            int ok_samples = 0, i;
+            double freqs[20], volts[20], load_freqs[20], load_volts[20];
+            int ok_samples = 0, ok_load = 0, i;
             PState ps;
 
             pci_lock();
-            if (smu_send(fam->cmd_set_all, (uint32_t)target) != 0) failures++;
-            if (smu_send(fam->cmd_set_single, (uint32_t)target) != 0) failures++;
+            {
+                uint32_t inarg[1] = { (uint32_t)target };
+                int st = hsmp_send(HSMP_SET_BOOST_LIMIT_ALL, inarg, 1, NULL, 0);
+                if (st != (int)SMU_OK) {
+                    log_msg("ERROR: HSMP SetBoostLimitSocket (0x9, arg %d MHz) failed, status=0x%02X (%s)",
+                            target, (unsigned)st, smu_status_name(st));
+                    failures++;
+                }
+                inarg[0] = (uint32_t)apic_load;
+                {
+                    uint32_t outarg[1] = { 0 };
+                    st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+                    if (st == (int)SMU_OK)
+                        log_msg("read-back after set to %d MHz: HSMP limit=%u MHz%s",
+                                target, outarg[0], (int)outarg[0] == target ? "" : " (SET DID NOT TAKE EFFECT)");
+                    else
+                        log_msg("read-back after set to %d MHz failed (status=0x%02X, %s)",
+                                target, (unsigned)st, smu_status_name(st));
+                    if (st != (int)SMU_OK || (int)outarg[0] != target) failures++;
+                }
+            }
             pci_unlock();
-            if (failures > 0 && ok_samples == 0 && target == cfg.start_mhz) {
+            if (failures > 0 && target == cfg.start_mhz) {
                 /* First step already failed to set the cap; still try to
                  * sample (the reading is then just the current state),
                  * but do not pretend the sweep is valid. */
@@ -801,12 +1151,22 @@ int main(void)
             Sleep((DWORD)cfg.settle_ms);
 
             for (i = 0; i < cfg.samples; i++) {
-                if (read_pstate_on_core(cfg.load_core ^ 1, &ps) == 0) {
+                if (read_pstate_on_core(reader_core, &ps) == 0) {
+                    PState pls;
+                    double lf = 0.0, lv = 0.0;
                     freqs[ok_samples] = ps.freq_mhz;
                     volts[ok_samples] = ps.volt_v;
-                    fprintf(g_csv, "%d,%d,%u,%u,%u,%.1f,%.4f\n",
+                    if (reader_core != cfg.load_core &&
+                        read_pstate_on_core(cfg.load_core, &pls) == 0) {
+                        lf = pls.freq_mhz; lv = pls.volt_v;
+                        load_freqs[ok_load] = lf; load_volts[ok_load] = lv; ok_load++;
+                    } else if (reader_core == cfg.load_core) {
+                        lf = ps.freq_mhz; lv = ps.volt_v;
+                        load_freqs[ok_load] = lf; load_volts[ok_load] = lv; ok_load++;
+                    }
+                    fprintf(g_csv, "%d,%d,%u,%u,%u,%.1f,%.4f,%.1f,%.4f\n",
                             target, i + 1, ps.fid, ps.dfsid, ps.vid,
-                            ps.freq_mhz, ps.volt_v);
+                            ps.freq_mhz, ps.volt_v, lf, lv);
                     ok_samples++;
                 } else {
                     log_msg("WARN: MSR read failed at %d MHz sample %d", target, i + 1);
@@ -817,8 +1177,15 @@ int main(void)
             if (ok_samples > 0) {
                 double med_f = median_of(freqs, ok_samples);
                 double med_v = median_of(volts, ok_samples);
-                log_msg("point: target=%d MHz -> median %.0f MHz @ %.3f V (%d/%d samples)",
-                        target, med_f, med_v, ok_samples, cfg.samples);
+                if (ok_load > 0) {
+                    double med_lf = median_of(load_freqs, ok_load);
+                    double med_lv = median_of(load_volts, ok_load);
+                    log_msg("point: target=%d MHz -> reader(core %d) median %.0f MHz @ %.3f V; load core(%d) median %.0f MHz @ %.3f V (%d/%d samples)",
+                            target, reader_core, med_f, med_v, cfg.load_core, med_lf, med_lv, ok_samples, cfg.samples);
+                } else {
+                    log_msg("point: target=%d MHz -> median %.0f MHz @ %.3f V (%d/%d samples)",
+                            target, med_f, med_v, ok_samples, cfg.samples);
+                }
             } else {
                 log_msg("point: target=%d MHz -> NO valid samples", target);
                 failures++;
@@ -836,12 +1203,29 @@ int main(void)
     CloseHandle(hload);
     fclose(g_csv);
 
-    /* Restore: both caps back to the value 0x6E reported before the sweep
-     * (the pre-sweep limit). If a cap was installed before the sweep, this
-     * puts it back -- the sweep is non-destructive. */
+    /* Restore: the HSMP socket cap back to the value 0xA reported before
+     * the sweep (the pre-sweep limit). If a cap was installed before the
+     * sweep, this puts it back -- the sweep is non-destructive. */
     pci_lock();
-    if (smu_send(fam->cmd_set_all, (uint32_t)restore_mhz) != 0) failures++;
-    if (smu_send(fam->cmd_set_single, (uint32_t)restore_mhz) != 0) failures++;
+    {
+        uint32_t inarg[1] = { (uint32_t)restore_mhz };
+        uint32_t outarg[1] = { 0 };
+        int st = hsmp_send(HSMP_SET_BOOST_LIMIT_ALL, inarg, 1, NULL, 0);
+        if (st != (int)SMU_OK) {
+            log_msg("ERROR: HSMP restore set (0x9, arg %d MHz) failed, status=0x%02X (%s)",
+                    restore_mhz, (unsigned)st, smu_status_name(st));
+            failures++;
+        }
+        inarg[0] = (uint32_t)apic_load;
+        st = hsmp_send(HSMP_GET_BOOST_LIMIT, inarg, 1, outarg, 1);
+        if (st == (int)SMU_OK)
+            log_msg("read-back after restore: HSMP limit=%u MHz (want %d MHz)%s",
+                    outarg[0], restore_mhz, (int)outarg[0] == restore_mhz ? "" : " -- MISMATCH, reboot to restore stock");
+        else
+            log_msg("read-back after restore failed (status=0x%02X, %s); reboot to restore stock",
+                    (unsigned)st, smu_status_name(st));
+        if (st != (int)SMU_OK || (int)outarg[0] != restore_mhz) failures++;
+    }
     pci_unlock();
 
     if (failures == 0) {
