@@ -1,4 +1,4 @@
-# Release: when a tag like v1.0.0 is pushed, build all three exes on
+# Release: when a tag like v1.0.0 is pushed, build all five exes on
 # Windows, pack everything a user needs into one zip, and attach it to
 # a GitHub Release so it can be downloaded directly from the Releases page.
 #
@@ -47,7 +47,7 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $stage = "dist/zenstates-c-$tag-windows-x64"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe, zenstates-c.ini, zenstates-vf.ini, README.md, README.zh-CN.md, LICENSE, ATTRIBUTION.md, install-autostart.bat, uninstall-autostart.bat -Destination $stage
+          Copy-Item zenstates-c.exe, zenstates-c-gui.exe, zenstates-c-gui-xl.exe, zenstates-vf.exe, zenstates-hsmp.exe, zenstates-c.ini, zenstates-vf.ini, README.md, README.zh-CN.md, LICENSE, ATTRIBUTION.md, install-autostart.bat, uninstall-autostart.bat -Destination $stage
           Copy-Item -Recurse modules -Destination "$stage/modules"
           Get-ChildItem -Recurse $stage | Format-Table FullName, Length
 
@@ -72,11 +72,11 @@ jobs:
             dist/SHA256SUMS
           generate_release_notes: true
           body: |
-            ZenStates-C ${{ github.ref_name }} — pure C Boost cap for Ryzen 3000 series desktop CPUs (Zen 2 / Matisse). A cap, not a fixed-frequency lock.
+            ZenStates-C ${{ github.ref_name }} — pure C Boost cap for Ryzen 3000 / 5000 / 7000 series desktop CPUs (Zen 2 / Zen 3 / Zen 4). A cap, not a fixed-frequency lock.
 
             Download `zenstates-c-${{ github.ref_name }}-windows-x64.zip`, extract it to any folder (keep all files together), and follow README.md.
             Requires the PawnIO driver (https://pawnio.eu/) — NOT included in this zip.
 
-            Contents: zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe (V/F sweep), zenstates-c.ini, zenstates-vf.ini, modules/ (signed LGPL PawnIO modules), README.md, README.zh-CN.md, LICENSE (GPLv3), ATTRIBUTION.md, install/uninstall-autostart.bat.
+            Contents: zenstates-c.exe, zenstates-c-gui.exe, zenstates-c-gui-xl.exe (2x layout), zenstates-vf.exe (V/F sweep), zenstates-hsmp.exe (HSMP probe), zenstates-c.ini, zenstates-vf.ini, modules/ (signed LGPL PawnIO modules), README.md, README.zh-CN.md, LICENSE (GPLv3), ATTRIBUTION.md, install/uninstall-autostart.bat.
 
-            ⚠️ First run on real hardware is a TEST: verify with HWMonitor that max frequency stops at ~4000 MHz. See README.md "Verify".
+            ⚠️ First run on real hardware is a TEST: verify with HWMonitor that max frequency stops at the cap. See README.md "Verify".

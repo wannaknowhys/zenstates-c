@@ -1,5 +1,5 @@
 # CI: build check on every push / PR.
-# Builds all three exes on Windows with MinGW-w64 UCRT64 (the same
+# Builds all five exes on Windows with MinGW-w64 UCRT64 (the same
 # toolchain family as build.bat), then uploads them as a workflow
 # artifact for inspection.
 # Nothing here runs the binaries: they refuse to run on any CPU that is
@@ -39,18 +39,24 @@ jobs:
       - name: Verify outputs
         shell: pwsh
         run: |
-          Get-ChildItem zenstates-c.exe, zenstates-c-gui.exe, zenstates-vf.exe | Format-Table Name, Length
+          Get-ChildItem zenstates-c.exe, zenstates-c-gui.exe, zenstates-c-gui-xl.exe, zenstates-vf.exe, zenstates-hsmp.exe | Format-Table Name, Length
           (Get-FileHash zenstates-c.exe -Algorithm SHA256).Hash
           (Get-FileHash zenstates-c-gui.exe -Algorithm SHA256).Hash
+          (Get-FileHash zenstates-c-gui-xl.exe -Algorithm SHA256).Hash
           (Get-FileHash zenstates-vf.exe -Algorithm SHA256).Hash
-          # Manifest sanity: main exe and VF exe must require Administrator, GUI must not.
+          (Get-FileHash zenstates-hsmp.exe -Algorithm SHA256).Hash
+          # Manifest sanity: main exe, VF exe and HSMP probe must require Administrator; both GUIs must not.
           # (Read bytes as ASCII: binary-safe, never throws on invalid UTF-8.)
           $main = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-c.exe"))
           if ($main -notmatch "requireAdministrator") { throw "zenstates-c.exe manifest missing requireAdministrator" }
           $vf = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-vf.exe"))
           if ($vf -notmatch "requireAdministrator") { throw "zenstates-vf.exe manifest missing requireAdministrator" }
+          $hsmp = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-hsmp.exe"))
+          if ($hsmp -notmatch "requireAdministrator") { throw "zenstates-hsmp.exe manifest missing requireAdministrator" }
           $gui = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-c-gui.exe"))
           if ($gui -notmatch "asInvoker") { throw "zenstates-c-gui.exe manifest missing asInvoker" }
+          $guixl = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("zenstates-c-gui-xl.exe"))
+          if ($guixl -notmatch "asInvoker") { throw "zenstates-c-gui-xl.exe manifest missing asInvoker" }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
@@ -59,4 +65,7 @@ jobs:
           path: |
             zenstates-c.exe
             zenstates-c-gui.exe
+            zenstates-c-gui-xl.exe
+            zenstates-vf.exe
+            zenstates-hsmp.exe
           if-no-files-found: error
