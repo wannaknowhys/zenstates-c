@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" name="ZenStates-VF" type="win32"/>
+  <description>ZenStates-VF: Ryzen 5 3600 empirical V/F sweep via PawnIO/SMU + MSR</description>
+  <!-- Must run elevated: opens the PawnIO device, whose DACL only allows
+       SYSTEM and Built-in Administrators. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" name="ZenStates-C" type="win32"/>
+  <description>ZenStates-C: Ryzen 5 3600 boost cap via PawnIO/SMU</description>
+  <!-- The main exe MUST run elevated: it opens the PawnIO device, whose
+       DACL only allows SYSTEM and Built-in Administrators. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

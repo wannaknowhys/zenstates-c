@@ -1,0 +1,38 @@
+# Build outputs (CI rebuilds these; do not commit binaries)
+*.exe
+*.o
+*.obj
+*.res
+*.ilk
+*.pdb
+*.lib
+*.exp
+*.dll
+
+# Investigation material: upstream source + release zip + decompiled output.
+# Never tracked, never published with the repo.
+investigation/
+
+# Logs and local test artefacts
+*.log
+zenstates-c.log
+
+# Python / tooling caches
+__pycache__/
+*.py[cod]
+
+# Editors / IDEs
+.vs/
+.vscode/
+*.user
+*.suo
+.idea/
+
+# OS artefacts
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local notes that are not part of the release
+*.tmp
+*.bak
